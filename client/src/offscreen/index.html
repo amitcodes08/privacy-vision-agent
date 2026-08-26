@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Privacy Vision Agent — local inference host</title>
+  </head>
+  <body>
+    <!-- Invisible document whose only job is to own the WebGPU worker.
+         The service worker cannot hold a WebGPU context; this can. -->
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

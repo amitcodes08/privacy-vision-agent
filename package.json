@@ -1,0 +1,25 @@
+{
+  "name": "privacy-vision-agent",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Client-dominant hybrid vision agent: local WebGPU VLM with privacy-redacted cloud escalation",
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "scripts": {
+    "dev": "npm-run-all --parallel dev:server dev:client",
+    "dev:client": "npm run dev --workspace client",
+    "dev:server": "npm run dev --workspace server",
+    "build": "npm run build --workspace client && npm run build --workspace server",
+    "test": "npm run test --workspace client && npm run test --workspace server",
+    "typecheck": "npm run typecheck --workspace client && npm run typecheck --workspace server"
+  },
+  "devDependencies": {
+    "npm-run-all": "4.1.5",
+    "typescript": "5.6.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
