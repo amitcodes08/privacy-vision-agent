@@ -39,7 +39,7 @@ export function buildPrompt(
   ranking?: Ranking,
   taskMemory?: import('@shared/types').TaskMemory,
 ): string {
-  const ranked = ranking ?? rankCandidates({ goal, dom, history });
+  const ranked = ranking ?? rankCandidates({ goal, dom, history, taskMemory });
   const relevant = new Set(ranked.candidates.slice(0, GUARANTEED_RELEVANT).map((c) => c.node.id));
 
   const chosen = new Map<number, ScrubbedNode>();

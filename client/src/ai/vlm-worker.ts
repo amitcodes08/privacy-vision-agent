@@ -21,7 +21,7 @@ import {
 export type WorkerRequest =
   | { type: 'PROBE'; id: string }
   | { type: 'INIT'; id: string; modelKey?: string }
-  | { type: 'INFER'; id: string; goal: string; dom: ScrubbedDom; frame: ImageBitmap; history?: AgentAction[] }
+  | { type: 'INFER'; id: string; goal: string; dom: ScrubbedDom; frame: ImageBitmap; history?: AgentAction[]; taskMemory?: import('@shared/types').TaskMemory }
   | { type: 'DISPOSE'; id: string };
 
 export type WorkerResponse =
@@ -107,6 +107,7 @@ async function handle(req: WorkerRequest): Promise<void> {
           goal: req.goal,
           dom: req.dom,
           history: req.history ?? [],
+          taskMemory: req.taskMemory,
         });
         const { raw, ...decision } = result;
         post({ type: 'DECISION', id: req.id, decision, raw });
