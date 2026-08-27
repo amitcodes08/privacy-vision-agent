@@ -17,12 +17,17 @@ import {
   type AgentStatus,
   type BoundingBox,
   type ScrubbedDom,
+  type TaskMemory,
+  type ActionResultCategory,
 } from '@shared/types';
 import { redactFrame, dataUrlToBitmap, downscaleFrame } from '~/privacy/canvas-redactor';
 import { WsClient } from '~/network/ws-client';
 import { planLocally } from '~/ai/local-planner';
 import { loadSettings, type Settings } from '~/lib/settings';
 import { logger, recentLogs } from '~/lib/log';
+import { checkTermination, corroborateDone, HIGH_CONFIDENCE } from '~/ai/termination-checker';
+import { makeStagnationState, recordAndCheck, fingerprint } from '~/ai/stagnation-guard';
+import { sanitiseCloudAction } from '~/ai/decision-parser';
 
 const OFFSCREEN_PATH = 'src/offscreen/index.html';
 
@@ -337,7 +342,15 @@ function frameOnce(): () => Promise<string> {
  * inside the worker. It only *plans* on its own when there is no working model
  * to plan with, which is the one case where the alternative is nothing at all.
  */
-async function step(tabId: number, goal: string, history: AgentAction[], settings: Settings): Promise<AgentAction> {
+interface StepResult {
+  action: AgentAction;
+  /** The ScrubbedDom produced by the scrape at the start of this step.
+   *  Returned so runAgent can pass it to the next iteration's termination
+   *  check without performing a redundant scrape. */
+  dom: ScrubbedDom;
+}
+
+async function step(tabId: number, goal: string, history: AgentAction[], settings: Settings, taskMemory: TaskMemory): Promise<StepResult> {
   const { dom, boxes, dpr } = await scrape(tabId);
   status.redactions += boxes.length;
   const frame = frameOnce();
@@ -355,6 +368,7 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
       dom,
       frameDataUrl: small.dataUrl,
       history,
+      taskMemory,
     });
     if (local.ok) {
       decision = local.decision;
@@ -369,8 +383,38 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
   }
 
   if (decision && decision.confidence >= settings.confidenceThreshold && decision.action.action !== 'escalate') {
-    status.localDecisions++;
-    return applyDecision(tabId, decision);
+    // --- VLM-done corroboration: verify a done signal against the DOM ------
+    // When the VLM says the goal is complete, run the cheap termination checker
+    // against the DOM we just scraped. This prevents two failure modes:
+    //   a) VLM done + low confidence → falls through to planner → escalation →
+    //      unnecessary cloud action (the primary bug).
+    //   b) VLM done but DOM clearly shows the goal is NOT met → blind trust.
+    if (decision.action.action === 'done') {
+      const domSignal = checkTermination({ goal, dom, history });
+      const corroborated = corroborateDone(decision.confidence, domSignal);
+      if (corroborated.done && corroborated.confidence >= HIGH_CONFIDENCE) {
+        logger.info('local', `vlm done corroborated by dom (${corroborated.reason}); stopping`);
+        status.localDecisions++;
+        return { action: decision.action, dom };
+      }
+      if (!corroborated.done) {
+        // DOM contradicts — treat as if the VLM did not decide.
+        logger.info(
+          'local',
+          `vlm says done but dom contradicts (${corroborated.reason}); continuing`,
+        );
+        // Fall through to planner/escalation with the corroboration evidence.
+        decision = null;
+      } else {
+        // DOM is uncertain — return the VLM done anyway with its own confidence.
+        // The confidence gate above already passed, so return it.
+        status.localDecisions++;
+        return { action: decision.action, dom };
+      }
+    } else {
+      status.localDecisions++;
+      return { action: await applyDecision(tabId, decision, dom), dom };
+    }
   }
 
   // --- Path 2: no usable model, so plan on-device -----------------
@@ -380,16 +424,16 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
   // better evidence than a vision model that read the page, and escalation
   // exists precisely for that case.
   const vlmUnusable = !decision || decision.confidence === 0;
-  const planned = vlmUnusable ? planLocally({ goal, dom, history }) : null;
+  const planned = vlmUnusable ? planLocally({ goal, dom, history, taskMemory }) : null;
   if (planned) {
     logger.info(
       'planner',
       `no usable vlm output; planner says ${planned.action.action} conf=${planned.confidence.toFixed(2)}`,
       reasonOf(planned),
     );
-    if (planned.confidence >= settings.confidenceThreshold && planned.action.action !== 'escalate') {
+    if (planned.confidence >= Math.max(settings.confidenceThreshold, 0.60) && planned.action.action !== 'escalate') {
       status.heuristicDecisions++;
-      return applyDecision(tabId, planned);
+      return { action: await applyDecision(tabId, planned, dom), dom };
     }
   }
 
@@ -407,10 +451,10 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
       if (fallback.source === 'heuristic') status.heuristicDecisions++;
       else status.localDecisions++;
       logger.info('escalate', `${escalationDown ? 'server unreachable' : 'disabled'}; acting on the best on-device decision`);
-      return applyDecision(tabId, fallback);
+      return { action: await applyDecision(tabId, fallback, dom), dom };
     }
     logger.warn('escalate', 'unavailable and nothing actionable on-device; stopping');
-    return { action: 'done', summary: 'low confidence and no escalation available' };
+    return { action: { action: 'done', summary: 'low confidence and no escalation available' }, dom };
   }
 
   const rawFrame = await frame();
@@ -439,13 +483,17 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
       imageMime: redacted.mime,
       dom,
       history,
+      taskMemory,
       localConfidence: best?.confidence ?? 0,
       localReason: (best && reasonOf(best)) ?? 'below threshold',
     });
     escalationFailures = 0;
     status.escalations++;
-    logger.info('escalate', `cloud decision ${response.decision.action.action}`, response.rationale);
-    return applyDecision(tabId, response.decision);
+    // Sanitise the cloud response before acting: strip fill-specific fields
+    // from click actions and other semantic inconsistencies.
+    const cloudDecision = sanitiseCloudAction(response.decision);
+    logger.info('escalate', `cloud decision ${cloudDecision.action.action}`, response.rationale);
+    return { action: await applyDecision(tabId, cloudDecision, dom), dom };
   } catch (err) {
     // The server is a convenience, not a dependency. Fall back on-device.
     escalationFailures++;
@@ -459,9 +507,9 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
     if (fallback) {
       if (fallback.source === 'heuristic') status.heuristicDecisions++;
       else status.localDecisions++;
-      return applyDecision(tabId, fallback);
+      return { action: await applyDecision(tabId, fallback, dom), dom };
     }
-    return { action: 'done', summary: 'no decision available on-device and escalation failed' };
+    return { action: { action: 'done', summary: 'no decision available on-device and escalation failed' }, dom };
   }
 }
 
@@ -480,33 +528,48 @@ function pickActionable(...candidates: (AgentDecision | null)[]): AgentDecision 
   for (const c of candidates) {
     if (!c) continue;
     const kind = c.action.action;
-    if (kind !== 'escalate' && kind !== 'done') return c;
+    if (kind !== 'escalate' && kind !== 'done' && kind !== 'invalid') return c;
   }
   return null;
 }
 
 /** Identity of an action for loop detection — kind plus target, no reason text. */
-const fingerprint = (a: AgentAction): string =>
+const domFingerprint = (a: AgentAction): string =>
   'selector' in a && a.selector ? `${a.action}:${a.selector}` : a.action;
 
 /** How many times the most recent action repeats consecutively at the tail. */
 function repeatedTail(history: readonly AgentAction[]): number {
   const last = history.at(-1);
   if (!last) return 0;
-  const key = fingerprint(last);
+  const key = domFingerprint(last);
   let n = 0;
-  for (let i = history.length - 1; i >= 0 && fingerprint(history[i]!) === key; i--) n++;
+  for (let i = history.length - 1; i >= 0 && domFingerprint(history[i]!) === key; i--) n++;
   return n;
 }
 
-async function applyDecision(tabId: number, decision: AgentDecision): Promise<AgentAction> {
+async function applyDecision(tabId: number, decision: AgentDecision, preDom?: ScrubbedDom): Promise<AgentAction> {
   status.lastDecision = decision;
   const action = decision.action;
-  if (action.action === 'done' || action.action === 'escalate') return action;
+  if (action.action === 'done' || action.action === 'escalate' || action.action === 'invalid') return action;
+  
   const res = await execute(tabId, action);
-  if (!res.ok) logger.warn('execute', `${action.action} failed`, res.error);
+  if (!res.ok) {
+    logger.warn('execute', `${action.action} failed`, res.error);
+    return { action: 'invalid', reason: res.error || 'execution failed' };
+  }
+
+  // Adaptive settlement for state-changing actions
+  if (preDom && (action.action === 'click' || action.action === 'fill' || action.action === 'navigate')) {
+    const immediate = await scrape(tabId);
+    if (fingerprint(preDom) === fingerprint(immediate.dom)) {
+       // State unchanged immediately, give it a short time to settle
+       await sleep(400);
+    }
+  }
+
   return action;
 }
+
 
 export async function runAgent(goal: string, tabId: number): Promise<void> {
   if (running) throw new Error('agent already running');
@@ -521,6 +584,19 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
   status.maxSteps = settings.maxSteps;
   status.lastError = undefined;
   const history: AgentAction[] = [];
+  const taskMemory: TaskMemory = {
+    goal,
+    completedObjectives: [],
+    attemptedTargets: [],
+    step: 0,
+  };
+
+  // --- Termination / stagnation state ----------------------------------
+  // `prevDom` is the ScrubbedDom produced by the *previous* step's scrape.
+  // We pass it to the termination checker so it can detect delta changes
+  let prevDom: ScrubbedDom | undefined;
+  let invalidCount = 0;
+  const stagnation = makeStagnationState();
 
   try {
     // Kick off (or join) the model load, but do not block the run on it: the
@@ -529,20 +605,118 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
 
     for (let i = 0; i < settings.maxSteps && !stopRequested; i++) {
       status.step = i + 1;
-      const action = await step(tabId, goal, history, settings);
+
+      // --- Cheap termination check (runs before VLM, zero extra I/O) -----
+      // Uses the ScrubbedDom cached from the *previous* step's scrape.
+      // On the first iteration prevDom is undefined, so the check is skipped.
+      if (prevDom !== undefined) {
+        const signal = checkTermination({
+          goal,
+          dom: prevDom,
+          lastAction: history.at(-1),
+          history,
+        });
+        if (signal.done && signal.confidence >= HIGH_CONFIDENCE) {
+          logger.info('termination', `early exit before step ${i + 1}: ${signal.reason}`);
+          history.push({ action: 'done', summary: signal.reason });
+          break;
+        }
+      }
+
+      taskMemory.step = i + 1;
+      const stepPrevDom = prevDom; // DOM from before this step, for delta checks
+      const result = await step(tabId, goal, history, settings, taskMemory);
+      const action = result.action;
       history.push(action);
+
+      // Update prevDom with the DOM scraped during this step.
+      // The termination checker on the *next* iteration will use it.
+      prevDom = result.dom;
+
       if (action.action === 'done') break;
 
-      // Stuck-loop guard. Without this, an agent repeating one ineffective
-      // action burns the whole step budget — and every one of those steps that
-      // fell through to escalation was a wasted upload.
+      // --- Post-step completion check (primary termination mechanism) -------
+      // Run the cheap deterministic checker against the DOM that was just
+      // scraped during this step — *after* the action executed and *before*
+      // starting another VLM inference. This is the fix for the observed bug:
+      // the loop was allowed to continue because the pre-step check used the
+      // *previous* step's DOM, and by the time the next pre-step check ran the
+      // VLM had already started (and the planner/escalation path was triggered).
+      //
+      // Zero extra I/O: result.dom is already available from the scrape that
+      // happened inside step().
+      const postSignal = checkTermination({
+        goal,
+        dom: result.dom,
+        lastAction: action,
+        history,
+        prevDom: stepPrevDom,
+      });
+      if (postSignal.done && postSignal.confidence >= HIGH_CONFIDENCE) {
+        logger.info('termination', `post-step exit after step ${i + 1}: ${postSignal.reason}`);
+        history.push({ action: 'done', summary: postSignal.reason });
+        break;
+      }
+
+      // --- Action Result Validation & Repeat Guard ----------------------
+      // If the action produced no meaningful state change, we shouldn't blindly repeat it.
+      // Unlike the emergency 3-repeat guard, this uses actual state reasoning.
+      const isActionWaitOrDone = action.action === 'wait' || action.action === 'escalate';
+      const stateChanged = stepPrevDom && fingerprint(stepPrevDom) !== fingerprint(result.dom);
+      let resultCategory: ActionResultCategory = action.action === 'invalid' ? 'failed' : (stateChanged ? 'state_changed' : (isActionWaitOrDone ? 'uncertain' : 'no_change'));
+
+      taskMemory.lastAction = { action, result: resultCategory };
+
+      if (resultCategory === 'state_changed') {
+        taskMemory.attemptedTargets = [];
+        if (action.completedObjective) {
+          taskMemory.completedObjectives.push({ description: action.completedObjective, status: 'completed' });
+          logger.info('task', `objective completed: ${action.completedObjective}`);
+        }
+        if (action.currentObjective) {
+          taskMemory.currentObjective = action.currentObjective;
+          logger.info('task', `next objective: ${action.currentObjective}`);
+        }
+      } else if (resultCategory === 'no_change' || resultCategory === 'failed') {
+        if ('selector' in action && action.selector) {
+          taskMemory.attemptedTargets.push(action.selector);
+        }
+      }
+
+      if (action.action === 'invalid') {
+        invalidCount++;
+        if (invalidCount >= 3) {
+          logger.warn('agent', 'too many invalid actions; stopping');
+          break;
+        }
+      } else {
+        invalidCount = 0;
+      }
+
+      if (action.action !== 'invalid' && !stateChanged && !isActionWaitOrDone && repeatedTail(history) >= 2) {
+        logger.warn('agent', `action ${domFingerprint(action)} produced no state change; stopping to prevent loop`);
+        break;
+      }
+
+      // --- Existing consecutive-repeat emergency guard ------------------
       if (repeatedTail(history) >= 3) {
-        logger.warn('agent', `same action ${fingerprint(action)} three times; stopping`);
+        logger.warn('agent', `same action ${domFingerprint(action)} three times; stopping`);
+        break;
+      }
+
+      // --- Structural stagnation guard ----------------------------------
+      // Records a fingerprint of the page that was just scraped and checks
+      // whether the page has been stuck in the same structural state across
+      // multiple distinct actions.
+      if (recordAndCheck(stagnation, prevDom, action, i)) {
+        logger.warn(
+          'agent',
+          `page stagnant at step ${i + 1} (${stagnation.totalNonWait} non-wait actions, no structural change); stopping`,
+        );
         break;
       }
 
       if (action.action === 'wait') await sleep(Math.min(action.ms, 5_000));
-      else await sleep(400); // let the page settle before re-observing
     }
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);

@@ -64,6 +64,8 @@ Rules:
   "selector":"<css from the list>","valueType":"USER_EMAIL|USER_FULL_NAME|USER_PHONE|USER_ADDRESS|LITERAL",
   "value":"<only when valueType is LITERAL>","confidence":0..1,"reason":"<short>"}
 - Only use selectors that appear verbatim in ELEMENTS.
+- IMPORTANT: You must ONLY emit one of the allowed executable actions (click, fill, scroll, navigate, wait, done). NEVER emit semantic phrases like "add to cart" as the "action" field.
+- If the goal requires interacting with a destination, prefer actionable state-changing elements (buttons) over navigation links.
 - Never invent or guess redacted content. Never emit passwords or OTP codes;
   the client refuses them.
 - Prefer "done" when the goal is already satisfied by the visible page.`;
@@ -261,9 +263,12 @@ export function userPrompt(req: InferenceRequestPayload): string {
   const { dom } = req;
   return [
     `GOAL: ${req.goal}`,
+    req.taskMemory?.currentObjective ? `CURRENT OBJECTIVE: ${req.taskMemory.currentObjective}` : '',
+    req.taskMemory?.completedObjectives?.length ? `COMPLETED OBJECTIVES: ${req.taskMemory.completedObjectives.map(o => o.description).join(', ')}` : '',
     `PAGE: ${dom.title} — ${dom.origin}${dom.url.replace(dom.origin, '')}`,
     `VIEWPORT: ${dom.viewport.width}x${dom.viewport.height} @ scrollY=${dom.viewport.scrollY}`,
     `LOCAL MODEL GAVE UP: confidence=${req.localConfidence ?? 'n/a'} reason=${req.localReason ?? 'n/a'}`,
+    req.taskMemory?.lastAction ? `LAST ACTION/RESULT: ${req.taskMemory.lastAction.action.action} -> ${req.taskMemory.lastAction.result}` : '',
     req.history?.length ? `HISTORY: ${req.history.map((h) => h.action).join(' -> ')}` : '',
     'ELEMENTS:',
     ...dom.nodes.slice(0, 80).map(

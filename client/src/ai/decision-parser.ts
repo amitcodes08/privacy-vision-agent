@@ -10,7 +10,7 @@
  * the model meant back to a real element before scoring it. Every element we
  * recover here is one escalation that does not happen.
  */
-import { type AgentAction, type ScrubbedDom, type ScrubbedNode, type ValueToken } from '@shared/types';
+import { type AgentAction, type AgentDecision, type ScrubbedDom, type ScrubbedNode, type ValueToken } from '@shared/types';
 import { inferValueType, rankCandidates, rankOf, type Ranking } from './local-planner';
 
 /** How many elements the prompt may list. Small models degrade with long lists. */
@@ -37,6 +37,7 @@ export function buildPrompt(
   dom: ScrubbedDom,
   history: AgentAction[] = [],
   ranking?: Ranking,
+  taskMemory?: import('@shared/types').TaskMemory,
 ): string {
   const ranked = ranking ?? rankCandidates({ goal, dom, history });
   const relevant = new Set(ranked.candidates.slice(0, GUARANTEED_RELEVANT).map((c) => c.node.id));
@@ -71,19 +72,41 @@ export function buildPrompt(
   // The element *id* is what the model must return — a short integer it can
   // copy reliably. Selectors are resolved from the id on our side, which
   // removes the single largest source of unusable local output.
+  //
+  // Completion reasoning is ordered FIRST: the model checks whether the goal
+  // is already satisfied before choosing any action. This matches the control
+  // flow in the agent loop, which runs a cheap DOM check before the VLM call
+  // and expects the VLM to corroborate with a `done` when appropriate.
   return [
-    'You are a browser agent. Look at the screenshot and pick the ONE next action.',
+    'You are a browser agent. Look at the screenshot carefully.',
     `GOAL: ${goal}`,
     `PAGE: ${trunc(dom.title, 80)}`,
+    '',
+    'STEP 1 — COMPLETION CHECK (do this first):',
+    'Is the GOAL already fully satisfied by what you see on the current page?',
+    '  • If YES → respond with: {"action":"done","summary":"<one sentence explaining why the goal is satisfied>"}',
+    '  • If NO  → proceed to STEP 2.',
+    '',
+    'STEP 2 — NEXT ACTION (only if goal is NOT yet satisfied):',
+    'Pick the ONE best next action from the elements below.',
     'ELEMENTS (id: description):',
     lines.join('\n'),
+    '',
+    'TASK MEMORY:',
+    `Current Objective: ${taskMemory?.currentObjective || 'Not set'}`,
+    taskMemory?.completedObjectives?.length ? `Completed: ${taskMemory.completedObjectives.map((o) => o.description).join(', ')}` : '',
     past && `ALREADY DONE: ${past} — do not repeat these.`,
+    taskMemory?.attemptedTargets?.length ? `ATTEMPTED BUT FAILED TARGETS: ${taskMemory.attemptedTargets.join(', ')}` : '',
     '',
     'Answer with one JSON object and nothing else.',
-    'Keys: "action" (one of click, fill, scroll, done), "id" (an element id from the list above),',
-    'and for fill also "valueType" (one of USER_EMAIL, USER_FULL_NAME, USER_PHONE, USER_ADDRESS, LITERAL)',
-    'plus "value" when valueType is LITERAL.',
-    'Use action "done" when the goal is already satisfied.',
+    'Keys:',
+    ' - "action" (one of click, fill, scroll, done, escalate)',
+    ' - "id" (an element id from the list above)',
+    ' - "completedObjective" (optional string if you just accomplished your previous objective)',
+    ' - "currentObjective" (optional string describing what you are trying to accomplish right now)',
+    'For fill, also include "valueType" (e.g. USER_EMAIL, LITERAL) and "value".',
+    '',
+    'You MUST output ONLY valid JSON. No markdown formatting, no explanations, no text outside the JSON object.',
   ]
     .filter(Boolean)
     .join('\n');
@@ -109,6 +132,7 @@ export interface ParseContext {
   history?: AgentAction[];
   /** Reuse the ranking already computed for the prompt. */
   ranking?: Ranking;
+  taskMemory?: import('@shared/types').TaskMemory;
 }
 
 /**
@@ -123,20 +147,30 @@ export function parseAction(
 ): { action: AgentAction; confidence: number } {
   const json = extractJson(raw);
   if (!json || typeof json !== 'object') {
-    return { action: { action: 'escalate', reason: 'no JSON in local output' }, confidence: 0 };
+    // Before giving up, check whether the raw text is a strong explicit completion statement.
+    if (parseDoneFromText(raw)) {
+      // Confidence 0.65: above the confidence threshold so the decision is
+      // treated as usable (not vlmUnusable), but below HIGH_CONFIDENCE so it
+      // still requires DOM corroboration before the loop stops unconditionally.
+      return { action: { action: 'done', summary: raw.trim().slice(0, 200) }, confidence: 0.65 };
+    }
+    // DO NOT emit `escalate` as a generic "I don't know".
+    // Unparseable output should result in an invalid action (confidence 0) so the planner can take over.
+    return { action: { action: 'invalid', reason: `no JSON in local output (output: "${raw.trim().slice(0, 100)}")` }, confidence: 0 };
   }
 
   const { action, match } = normalize(json as Record<string, unknown>, dom);
-  if (!action) return { action: { action: 'escalate', reason: 'schema mismatch' }, confidence: 0.1 };
+  if (!action) {
+    const attempted = (json as any).action || 'unknown';
+    return { action: { action: 'invalid', reason: `invalid action emitted: "${attempted}"` }, confidence: 0 };
+  }
   if (action.action === 'escalate') return { action, confidence: 0 };
   if (action.action === 'done') return { action, confidence: 0.7 };
   if (action.action === 'wait') return { action, confidence: 0.6 };
   if (action.action === 'navigate') return { action, confidence: 0.6 };
   if (action.action === 'scroll' && !action.selector) return { action, confidence: 0.65 };
+  if (action.action === 'invalid') return { action, confidence: 0 };
 
-  // An unresolvable selector is the one case worth escalating over: acting on
-  // it would poke at an element we cannot see.
-  if (match === 'unresolved') return { action, confidence: 0.12 };
 
   let confidence = 0.55;
   if (match === 'exact') confidence += 0.32;
@@ -161,6 +195,68 @@ export function parseAction(
   return { action, confidence: Math.max(0, Math.min(1, confidence)) };
 }
 
+/**
+ * Detect natural-language completion statements that small models emit
+ * *instead of* a JSON `done` object.
+ *
+ * Deliberately narrow — we only match strong, unambiguous explicit completion
+ * phrases. Arbitrary assistant text must NOT become `done`. A false negative
+ * (missed done) is far cheaper than a false positive (premature stop).
+ *
+ * Exported for unit tests; not part of the public decision-making API.
+ */
+export function parseDoneFromText(raw: string): boolean {
+  const t = raw.trim();
+  if (!t || t.length < 10) return false;
+
+  // The patterns below are anchored to the start of the response (optionally
+  // preceded by whitespace/quotes) so they do not fire on a sentence that
+  // happens to contain "goal is satisfied" as a subordinate clause.
+  const DONE_PATTERNS = [
+    /^(?:the )?goal is already satisfied/i,
+    /^the goal is satisfied/i,
+    /^the goal is already complete/i,
+    /^(?:the )?task is (?:already )?(?:complete|done|finished)/i,
+    /^the requested (?:task|action|goal) (?:has been|is) (?:complete|done|finished|accomplished)/i,
+    // The specific phrase observed in the bug report:
+    /^the goal is already satisfied by (?:the )?(?:current|what you see)/i,
+    // Prompt echo: the model restated step-1 output verbatim
+    /^(?:the )?goal is already fully satisfied/i,
+  ];
+
+  const lower = t.toLowerCase();
+  return DONE_PATTERNS.some((re) => re.test(lower));
+}
+
+/**
+ * Strip semantically-inconsistent fields from a cloud-sourced AgentDecision.
+ *
+ * The cloud occasionally returns a `click` action that includes `valueType`
+ * and `value` fields intended for `fill`. These fields are ignored by the
+ * browser executor but signal a confused model response. Sanitising here
+ * prevents accidental misuse if the executor is ever extended.
+ *
+ * Safe to call on local decisions too — it is a no-op for well-formed actions.
+ */
+export function sanitiseCloudAction(decision: AgentDecision): AgentDecision {
+  const a = decision.action;
+  if (a.action !== 'click') return decision;
+
+  // A click action must not carry fill-specific fields.
+  const raw = a as unknown as Record<string, unknown>;
+  const hasFillFields = 'valueType' in raw || ('value' in raw && typeof raw.value === 'string');
+  if (!hasFillFields) return decision;
+
+  // Reject malformed combinations instead of silently dropping fields.
+  return {
+    ...decision,
+    action: {
+      action: 'invalid',
+      reason: 'malformed cloud response: click action contained fill fields',
+    },
+  };
+}
+
 export type Match = 'exact' | 'repaired' | 'unresolved' | 'none';
 
 /** Coerce whatever the model produced into a valid `AgentAction`. */
@@ -169,21 +265,26 @@ function normalize(obj: Record<string, unknown>, dom: ScrubbedDom): { action: Ag
   const kind = ACTION_SYNONYMS[kindRaw];
   if (!kind) return { action: null, match: 'none' };
 
+  const memFields = {
+    ...(obj.completedObjective ? { completedObjective: str(obj.completedObjective) } : {}),
+    ...(obj.currentObjective ? { currentObjective: str(obj.currentObjective) } : {}),
+  };
+
   if (kind === 'done') {
     const summary = str(obj.summary ?? obj.reason);
-    return { action: summary ? { action: 'done', summary } : { action: 'done' }, match: 'none' };
+    return { action: { action: 'done', ...(summary ? { summary } : {}), ...memFields }, match: 'none' };
   }
   if (kind === 'escalate') {
-    return { action: { action: 'escalate', reason: str(obj.reason) }, match: 'none' };
+    return { action: { action: 'escalate', reason: str(obj.reason), ...memFields }, match: 'none' };
   }
   if (kind === 'wait') {
     const ms = num(obj.ms ?? obj.duration) ?? 500;
-    return { action: { action: 'wait', ms: Math.max(0, Math.min(5_000, ms)) }, match: 'none' };
+    return { action: { action: 'wait', ms: Math.max(0, Math.min(5_000, ms)), ...memFields }, match: 'none' };
   }
   if (kind === 'navigate') {
     const url = str(obj.url ?? obj.href);
     if (!url || !/^https?:\/\//i.test(url)) return { action: null, match: 'none' };
-    return { action: { action: 'navigate', url, reason: str(obj.reason) }, match: 'none' };
+    return { action: { action: 'navigate', url, reason: str(obj.reason), ...memFields }, match: 'none' };
   }
 
   const resolved = resolveTarget(obj, dom);
@@ -191,10 +292,10 @@ function normalize(obj: Record<string, unknown>, dom: ScrubbedDom): { action: Ag
   if (kind === 'scroll') {
     const deltaY = num(obj.deltaY ?? obj.delta ?? obj.amount);
     if (resolved.node) {
-      return { action: { action: 'scroll', selector: resolved.node.selector, reason: str(obj.reason) }, match: resolved.match };
+      return { action: { action: 'scroll', selector: resolved.node.selector, reason: str(obj.reason), ...memFields }, match: resolved.match };
     }
     return {
-      action: { action: 'scroll', deltaY: deltaY ?? Math.round(dom.viewport.height * 0.8), reason: str(obj.reason) },
+      action: { action: 'scroll', deltaY: deltaY ?? Math.round(dom.viewport.height * 0.8), reason: str(obj.reason), ...memFields },
       match: 'none',
     };
   }
@@ -203,19 +304,25 @@ function normalize(obj: Record<string, unknown>, dom: ScrubbedDom): { action: Ag
   if (!resolved.node) {
     const selector = str(obj.selector ?? obj.css ?? obj.element);
     if (!selector) return { action: null, match: 'none' };
-    // Keep the model's selector but mark it unverified; the caller scores it
-    // low enough that the local planner gets a shot first.
     return {
-      action:
-        kind === 'fill'
-          ? { action: 'fill', selector, valueType: valueTokenOf(obj) ?? 'LITERAL', ...literal(obj), reason: str(obj.reason) }
-          : { action: 'click', selector, reason: str(obj.reason) },
-      match: 'unresolved',
+      action: {
+        action: 'invalid',
+        reason: `target element "${selector}" not found in DOM`,
+        ...memFields
+      },
+      match: 'none',
     };
   }
 
   const node = resolved.node;
   if (kind === 'fill') {
+    const isFillable = node.tag === 'input' || node.tag === 'textarea' || 
+                       node.role === 'textbox' || node.role === 'combobox' || node.role === 'searchbox';
+    
+    if (!isFillable) {
+      return { action: { action: 'invalid', reason: 'fill action targeted a non-input element' }, match: 'none' };
+    }
+
     const valueType = valueTokenOf(obj) ?? inferValueType(node);
     return {
       action: {
@@ -225,11 +332,17 @@ function normalize(obj: Record<string, unknown>, dom: ScrubbedDom): { action: Ag
         reason: str(obj.reason),
         ...(valueType === 'LITERAL' ? literal(obj) : {}),
         ...(bool(obj.submit) ? { submit: true } : {}),
+        ...memFields,
       },
       match: resolved.match,
     };
   }
-  return { action: { action: 'click', selector: node.selector, reason: str(obj.reason) }, match: resolved.match };
+  
+  if ('valueType' in obj || 'valuetype' in obj || 'value_type' in obj || ('value' in obj && typeof obj.value === 'string')) {
+    return { action: { action: 'invalid', reason: 'click action contained fill fields' }, match: 'none' };
+  }
+
+  return { action: { action: 'click', selector: node.selector, reason: str(obj.reason), ...memFields }, match: resolved.match };
 }
 
 /**

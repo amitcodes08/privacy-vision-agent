@@ -18,7 +18,8 @@ export type ActionKind =
   | 'navigate'
   | 'wait'
   | 'escalate'
-  | 'done';
+  | 'done'
+  | 'invalid';
 
 /**
  * Placeholders the *server* is allowed to emit instead of raw values.
@@ -34,13 +35,18 @@ export type ValueToken =
   | 'OTP_CODE'
   | 'LITERAL';
 
-export interface ClickAction {
+export interface ActionBase {
+  completedObjective?: string;
+  currentObjective?: string;
+}
+
+export interface ClickAction extends ActionBase {
   action: 'click';
   selector: string;
   reason?: string;
 }
 
-export interface FillAction {
+export interface FillAction extends ActionBase {
   action: 'fill';
   selector: string;
   /** Where the client should source the text from. */
@@ -51,7 +57,7 @@ export interface FillAction {
   reason?: string;
 }
 
-export interface ScrollAction {
+export interface ScrollAction extends ActionBase {
   action: 'scroll';
   /** CSS selector to scroll into view; omit to scroll the viewport. */
   selector?: string;
@@ -59,27 +65,33 @@ export interface ScrollAction {
   reason?: string;
 }
 
-export interface NavigateAction {
+export interface NavigateAction extends ActionBase {
   action: 'navigate';
   url: string;
   reason?: string;
 }
 
-export interface WaitAction {
+export interface WaitAction extends ActionBase {
   action: 'wait';
   ms: number;
   reason?: string;
 }
 
 /** Emitted by the *local* model only: "I cannot decide, ask the cloud." */
-export interface EscalateAction {
+export interface EscalateAction extends ActionBase {
   action: 'escalate';
   reason?: string;
 }
 
-export interface DoneAction {
+export interface DoneAction extends ActionBase {
   action: 'done';
   summary?: string;
+}
+
+/** Emitted when model output is unparseable or completely malformed. */
+export interface InvalidAction extends ActionBase {
+  action: 'invalid';
+  reason: string;
 }
 
 export type AgentAction =
@@ -89,7 +101,8 @@ export type AgentAction =
   | NavigateAction
   | WaitAction
   | EscalateAction
-  | DoneAction;
+  | DoneAction
+  | InvalidAction;
 
 /** An action plus the metadata used by the escalation gate. */
 export interface AgentDecision {
@@ -99,6 +112,29 @@ export interface AgentDecision {
   source: 'local' | 'cloud' | 'heuristic';
   latencyMs?: number;
   modelId?: string;
+}
+
+/* ------------------------------------------------------------------ *
+ * Task Memory
+ * ------------------------------------------------------------------ */
+
+export interface TaskObjective {
+  description: string;
+  status: 'active' | 'completed';
+}
+
+export type ActionResultCategory = 'state_changed' | 'no_change' | 'failed' | 'uncertain';
+
+export interface TaskMemory {
+  goal: string;
+  currentObjective?: string;
+  completedObjectives: TaskObjective[];
+  lastAction?: {
+    action: AgentAction;
+    result: ActionResultCategory;
+  };
+  attemptedTargets: string[];
+  step: number;
 }
 
 /* ------------------------------------------------------------------ *
@@ -210,6 +246,7 @@ export interface InferenceRequestPayload {
   /** Why the local model gave up. */
   localConfidence?: number;
   localReason?: string;
+  taskMemory?: TaskMemory;
 }
 
 export interface InferenceResponsePayload {
@@ -270,6 +307,7 @@ const ACTION_KINDS: readonly ActionKind[] = [
   'wait',
   'escalate',
   'done',
+  'invalid',
 ];
 
 export function isActionKind(value: unknown): value is ActionKind {
@@ -292,6 +330,7 @@ export function isAgentAction(value: unknown): value is AgentAction {
     case 'scroll':
     case 'escalate':
     case 'done':
+    case 'invalid':
       return true;
     default:
       return false;

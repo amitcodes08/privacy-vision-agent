@@ -36,6 +36,14 @@ const FILES = dom([
   node({ id: 2, selector: '#readme', tag: 'a', text: 'README.md', href: 'https://shop.test/repo/blob/main/README.md' }),
 ]);
 
+const PRODUCT_PAGE = dom([
+  node({ id: 0, selector: '#header-cart', tag: 'a', role: 'link', text: 'Cart (0)' }),
+  node({ id: 1, selector: '#title', tag: 'h1', text: 'Privacy Vision Agent Test Product' }),
+  node({ id: 2, selector: '#price', tag: 'span', text: '$19.99' }),
+  node({ id: 3, selector: '#add-btn', tag: 'button', text: 'Add requested item' }),
+  node({ id: 4, selector: '#footer', tag: 'a', role: 'link', text: 'Contact Us' }),
+]);
+
 describe('planLocally', () => {
   it('maps "accept cookies" onto an Accept button via synonyms', () => {
     const d = planLocally({ goal: 'accept cookies', dom: CONSENT });
@@ -82,6 +90,62 @@ describe('planLocally', () => {
     if ('selector' in d.action) expect(d.action.selector).not.toBe('#accept');
   });
 
+  it('falls back to scrolling if nothing matches', () => {
+    const d = planLocally({ goal: 'scroll down to see more', dom: CONSENT });
+    expect(d.action).toMatchObject({ action: 'scroll' });
+  });
+
+  describe('TaskMemory integration', () => {
+    it('uses currentObjective instead of goal when available', () => {
+      // Goal says "search", but memory says current objective is "login"
+      const taskMemory: import('@shared/types').TaskMemory = {
+        goal: 'search for products and login',
+        currentObjective: 'enter my email address',
+        completedObjectives: [],
+        attemptedTargets: [],
+        step: 1,
+      };
+      const d = planLocally({ goal: taskMemory.goal, dom: LOGIN, taskMemory });
+      expect(d.action).toMatchObject({ action: 'fill', selector: '#email' });
+    });
+
+    it('penalizes previously attempted targets to avoid loops', () => {
+      const taskMemory: import('@shared/types').TaskMemory = {
+        goal: 'login',
+        currentObjective: 'Sign in',
+        completedObjectives: [],
+        attemptedTargets: ['#submit'], // Assume clicking sign-in failed/no-change
+        step: 2,
+      };
+      const d = planLocally({ goal: taskMemory.goal, dom: LOGIN, taskMemory });
+      // Because #submit is heavily penalized, it should NOT choose it again easily.
+      // Depending on other matches, it might pick something else or fail. 
+      // If nothing else matches well, it returns done (no element matches).
+      if (d.action.action === 'click') {
+        expect(d.action.selector).not.toBe('#submit');
+      }
+    });
+  });
+
+  describe('Action Grounding', () => {
+    it('prefers a state-changing control over a navigation element for an active objective', () => {
+      // For a state-changing verb ("Add"), the planner should strongly prefer 
+      // the actionable button over the pure navigation link containing "Cart"
+      const d = planLocally({
+        goal: 'test task',
+        dom: PRODUCT_PAGE,
+        taskMemory: {
+          goal: 'test task',
+          currentObjective: 'Add the current item to the requested destination',
+          completedObjectives: [],
+          attemptedTargets: [],
+          step: 1,
+        },
+      });
+      expect(d.action).toMatchObject({ action: 'click', selector: '#add-btn' });
+    });
+  });
+
   it('honours a bare scroll goal with no matching element', () => {
     const d = planLocally({ goal: 'scroll down', dom: dom([]) });
     expect(d.action).toMatchObject({ action: 'scroll', deltaY: 640 });
@@ -89,8 +153,11 @@ describe('planLocally', () => {
 
   it('stops rather than guessing when nothing matches', () => {
     const d = planLocally({ goal: 'download the quarterly tax report', dom: CONSENT });
-    expect(d.action.action).toBe('done');
-    expect(d.confidence).toBeLessThan(0.5);
+    expect(d.action.action).toBe('invalid');
+    if ('reason' in d.action) {
+      expect(d.action.reason).toBe('NO_ACTIONABLE_TARGET');
+    }
+    expect(d.confidence).toBe(0);
   });
 
   it('does not exceed the heuristic confidence ceiling', () => {
@@ -101,7 +168,8 @@ describe('planLocally', () => {
   it('does whole-word matching, so "log" does not fire on "blog"', () => {
     const blog = dom([node({ id: 0, selector: '#blog', tag: 'a', text: 'Blog' })]);
     const d = planLocally({ goal: 'log in to my account', dom: blog });
-    expect(d.action.action).toBe('done');
+    expect(d.action.action).toBe('invalid');
+    if ('reason' in d.action) expect(d.action.reason).toBe('NO_ACTIONABLE_TARGET');
   });
 
   it('targets the named file for "click on package.json"', () => {
