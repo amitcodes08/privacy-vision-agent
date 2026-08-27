@@ -89,7 +89,7 @@ npm run smoke --workspace server   # CONNECT + INFERENCE_REQUEST round trip
 
 ## Local inference, and what it took to make it actually run
 
-Three things had to be right before the on-device model produced a usable
+Four things had to be right before the on-device model produced a usable
 action rather than silently deferring to the server:
 
 - **Quantization is per ONNX graph, not per model.** SmolVLM ships as
@@ -106,6 +106,12 @@ action rather than silently deferring to the server:
   and on failure the JSON extractor latched onto the schema example *inside
   the prompt* — which parses, but is not a valid action. Slicing by
   `input_ids` length removes the failure mode.
+- **Show the model the element it needs.** `dom.nodes` holds up to 120
+  entries, so listing the first N in DOM order could omit the one element the
+  goal was about — the model then had no way to answer and looked "unsure" for
+  a reason that was our fault. The ranker reserves slots for goal-relevant
+  elements; the rest of the budget is page context. Emission stays in DOM order
+  so the list lines up with the screenshot.
 
 The prompt asks the model for a numeric element **id** rather than a CSS
 selector, and [decision-parser.ts](client/src/ai/decision-parser.ts) resolves
@@ -115,12 +121,21 @@ before scoring. Recovering a near-miss is one escalation that does not happen.
 ## Verification status
 
 ```
-client: 50 passed, 2 skipped   (vitest, jsdom)
+client: 64 passed, 2 skipped   (vitest, jsdom)
 server:  8 passed              (vitest)
 tsc --noEmit: clean in both workspaces
 vite build:   extension bundles (transformers/onnxruntime isolated to the worker chunk)
-smoke:        WS round trip 4-5 ms against the heuristic planner
+smoke:        WS round trip 4-5 ms with VLM_PROVIDER=heuristic
 ```
+
+With Ollama configured the smoke round trip is dominated by the model, not the
+transport: a cold `qwen2.5vl:7b` (6 GB) does not finish loading inside
+`OLLAMA_TIMEOUT_MS`, so the call aborts at 25 s and the heuristic planner
+answers instead. That is the intended shape — the abort exists so the fallback
+lands *inside* the client's 60 s escalation timeout rather than after it. A warm
+model answers normally. Note the smoke fixture's 1×1 JPEG is rejected by
+`qwen2.5vl` regardless of load state, so exercising the real Ollama vision path
+needs a realistic frame.
 
 The two skipped tests assert the <30 ms redaction budget; they need a real
 `OffscreenCanvas`, so they only run in a browser-backed test environment.
@@ -133,8 +148,9 @@ need a manual pass.
 - The unredacted frame reaches exactly one consumer: the offscreen WebGPU
   worker. `background/index.ts` hands `WsClient` only `redactFrame()` output.
   The downscale in `downscaleFrame()` also stays on the local path.
-- Tier 2 is a pure function of the already-scrubbed DOM, so the cheapest
-  fallback is also the most private one.
+- The ranker is a pure function of the already-scrubbed DOM, so both the
+  prompt grounding and the tier-2 fallback are the most private paths, not
+  just the cheapest.
 - Sensitive field values are replaced before serialization, not after:
   `dom-scrubber.ts` never copies a password, card, CVV, or OTP value into the
   payload; free text is run through `redactText()`.
@@ -153,9 +169,11 @@ need a manual pass.
 - Confidence is scored structurally (does the element resolve? is it enabled?)
   rather than from token logprobs. Wiring `output_scores` in would make the
   gate sharper.
-- The tier-2 planner is keyword- and synonym-driven. It handles consent
-  banners, logins, and search boxes well; it will not reason about multi-step
-  intent, which is exactly what tiers 1 and 3 are for.
+- The keyword ranker is synonym-driven. It grounds the prompt well for consent
+  banners, logins, and search boxes, but it cannot rank an element whose
+  wording shares nothing with the goal — such an element still reaches the
+  prompt only as page-context filler, and the VLM has to spot it from the
+  screenshot.
 - `sharp` ships two high-severity libvips advisories as a transitive,
   Node-only dependency of `@huggingface/transformers`; it is not part of the
   extension bundle.

@@ -23,6 +23,17 @@ const apiKey = process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY;
 
 export const OLLAMA_BASE_URL = (process.env.OLLAMA_BASE_URL ?? 'http://127.0.0.1:11434').replace(/\/+$/, '');
 
+/**
+ * Hard ceiling on one Ollama call.
+ *
+ * Cold-loading a 7B vision model takes ~60s, which is longer than the client's
+ * own 60s escalation timeout — so without this the client gave up first and
+ * the user saw "escalation timed out" while the server was still working, with
+ * no fallback ever delivered. Aborting early instead lets the heuristic planner
+ * answer within the client's window.
+ */
+const OLLAMA_TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS ?? 25_000);
+
 // Determine active provider:
 // Explicit VLM_PROVIDER, or fallback to 'gemini' if API key is present, or default to 'ollama'.
 export const provider: VlmProvider = ((): VlmProvider => {
@@ -134,6 +145,14 @@ async function planWithOllama(req: InferenceRequestPayload, started: number): Pr
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(OLLAMA_TIMEOUT_MS),
+  }).catch((err: unknown) => {
+    // `AbortError` here means a cold or wedged model, not a bad request. Say so,
+    // because "fell back to heuristic" is otherwise mystifying in the logs.
+    if (err instanceof Error && err.name === 'TimeoutError') {
+      throw new Error(`Ollama did not respond within ${OLLAMA_TIMEOUT_MS}ms (model still loading?)`);
+    }
+    throw err;
   });
 
   if (!response.ok) {

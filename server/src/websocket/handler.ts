@@ -19,6 +19,15 @@ import { activeModelId, planAction } from '../ai/cloud-vlm.ts';
 const LATENCY_BUDGET_MS = Number(process.env.LATENCY_BUDGET_MS ?? 1500);
 const MAX_REQUESTS_PER_MIN = Number(process.env.MAX_REQUESTS_PER_MIN ?? 60);
 
+/**
+ * Must stay below the client's own escalation timeout (60s in `ws-client.ts`).
+ * It used to be `max(LATENCY_BUDGET_MS * 4, 90_000)`, i.e. always longer — so
+ * on a slow model the client timed out first and the response, fallback
+ * included, was never delivered. Failing on our side means the client at least
+ * receives a MODEL_ERROR it can act on.
+ */
+const INFERENCE_DEADLINE_MS = Math.min(45_000, Math.max(LATENCY_BUDGET_MS * 4, 20_000));
+
 interface Session {
   id: string;
   clientId?: string;
@@ -124,7 +133,7 @@ async function handleInference(
   stats.requests++;
   const started = Date.now();
   try {
-    const result = await withTimeout(planAction(payload), Math.max(LATENCY_BUDGET_MS * 4, 90_000));
+    const result = await withTimeout(planAction(payload), INFERENCE_DEADLINE_MS);
     const elapsed = Date.now() - started;
     latencies.push(elapsed);
     if (latencies.length > 500) latencies.shift();
