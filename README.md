@@ -1,61 +1,69 @@
 # Privacy Vision Agent
 
-A client-dominant hybrid vision agent. A quantized VLM runs **inside the
-browser on WebGPU** and decides what to do with zero network calls. A
-deterministic keyword ranker keeps it honest: it picks which page elements the
-model gets to look at, and afterwards corroborates whatever the model chose.
-Only when the model produces nothing usable does the extension escalate — and
-then it sends a **redacted** screenshot plus a **scrubbed** DOM to a WebSocket
-server, which returns a *structural* command whose private values are
-re-hydrated locally.
+A client-dominant, privacy-preserving hybrid vision agent with hierarchical multi-step planning.
+
+1. **Client-Side Query Planning**: Chrome Built-in **Gemini Nano (`ai.languageModel`)** decomposes complex, multi-clause user goals into an ordered sequence of atomic sub-objectives (with zero-overhead offline linguistic fallback).
+2. **On-Device Vision Grounding**: A quantized **SmolVLM-256M-Instruct** model runs **inside the browser on WebGPU** to visually ground and execute each atomic sub-objective with zero network calls.
+3. **Deterministic Ranker & Corroborator**: Grounds prompt element budgets and validates model intent against the active sub-goal.
+4. **Termination Safeguards**: Validates progress against the entire sub-objective plan, preventing premature termination on intermediate search results.
+5. **Redacted Cloud Escalation**: When the local model produces nothing usable, the extension escalates by sending a **redacted** screenshot (PII blacked out) plus a **scrubbed** DOM to a WebSocket server, which returns a structural command re-hydrated locally.
 
 ```
-content script ──scrubbed DOM + sensitive boxes──┐
-                                                 ▼
-                          keyword ranker ──picks the elements──┐
-                                    │                          ▼
-captureVisibleTab ──raw frame──► offscreen ► WebGPU worker ► VLM plans the action
-                                                               │
-                                          ranker corroborates ─┤   (agreement raises confidence)
-                                                               ▼
-                                                             action              (1: local, no network)
-                                    │
-                       no usable model output
-                                    ▼
-                        ranker plans it instead ──► action                       (2: local, no network)
-                                    │
-                        VLM unsure about a real element
-                                    ▼
-                      canvas redactor (black boxes)
-                                    ▼
-                     ws://localhost:8080 ► cloud VLM
-                                    ▼
-                 {action, selector, valueType} ► local hydration ► action        (3: last resort)
+                      User Goal (e.g. "Search for shoes and add to cart")
+                                              │
+                                              ▼
+                         [Gemini Nano / Query Decomposer]
+                                              │
+                                              ▼
+                              Ordered Sub-Objectives Checklist
+                                              │
+content script ──scrubbed DOM + sensitive boxes──┤
+                                              ▼
+                           keyword ranker ──grounds active sub-goal──┐
+                                     │                               ▼
+captureVisibleTab ──raw frame──► offscreen ► WebGPU worker ► SmolVLM-256M plans action
+                                                                │
+                                           ranker corroborates ─┤   (agreement raises confidence)
+                                                                ▼
+                                                              action              (1: local, no network)
+                                     │
+                        no usable model output
+                                     ▼
+                         ranker plans it instead ──► action                       (2: local, no network)
+                                     │
+                         VLM unsure about a real element
+                                     ▼
+                       canvas redactor (black boxes)
+                                     ▼
+                      ws://localhost:8080 ► cloud VLM (Gemini / Ollama)
+                                     ▼
+                  {action, selector, valueType} ► local hydration ► action        (3: last resort)
+                                     │
+                                     ▼
+                      State Changed? Advance Sub-Objective ──► Repeat / Done
 ```
 
-**The VLM is the planner.** The ranker never overrides a model that actually
-chose an element — a keyword match is not better evidence than a vision model
-that read the page, and tier 3 exists for exactly that case. The ranker plans
-alone only in tier 2, when there is no working model to plan with and the
-alternative is nothing at all.
+**The VLM is the planner for each atomic sub-goal.** The ranker never overrides a model that actually chose an element. Tier 3 (cloud escalation) acts strictly as a fallback when on-device models are unsure.
 
 ## Layout
 
 | Path | Role |
 | --- | --- |
-| [shared/types.ts](shared/types.ts) | Wire contract: actions, envelopes, scrubbed DOM, guards |
+| [shared/types.ts](shared/types.ts) | Wire contract: actions, envelopes, scrubbed DOM, `TaskMemory` with sub-objectives |
+| [client/src/ai/nano-query-planner.ts](client/src/ai/nano-query-planner.ts) | Chrome Gemini Nano (`ai.languageModel`) query decomposer + rule-based fallback |
+| [client/src/ai/termination-checker.ts](client/src/ai/termination-checker.ts) | Multi-step completion validator; guards against premature termination |
 | [client/src/content/dom-scrubber.ts](client/src/content/dom-scrubber.ts) | Page → `ScrubbedDom` + boxes to black out |
 | [client/src/privacy/pii-detector.ts](client/src/privacy/pii-detector.ts) | Luhn/Verhoeff-checked PII rules, deterministic |
 | [client/src/privacy/canvas-redactor.ts](client/src/privacy/canvas-redactor.ts) | Destructive box painting → JPEG base64 |
-| [client/src/ai/models.ts](client/src/ai/models.ts) | Model catalogue + **per-graph** quantization |
+| [client/src/ai/models.ts](client/src/ai/models.ts) | Model catalogue (`SmolVLM-256M` default) + **per-graph** quantization |
 | [client/src/ai/model-loader.ts](client/src/ai/model-loader.ts) | Transformers.js v3 load + generate |
 | [client/src/ai/ort-assets.ts](client/src/ai/ort-assets.ts) | Where onnxruntime may load WASM from, and in which shape |
 | [client/src/ai/decision-parser.ts](client/src/ai/decision-parser.ts) | Prompt building, model text → action, selector repair + confidence |
-| [client/src/ai/local-planner.ts](client/src/ai/local-planner.ts) | Keyword ranker: grounds the prompt, corroborates, and plans when there is no model |
+| [client/src/ai/local-planner.ts](client/src/ai/local-planner.ts) | Keyword ranker: grounds active sub-goal in prompt and corroborates |
 | [client/src/ai/vlm-worker.ts](client/src/ai/vlm-worker.ts) | Worker that owns the WebGPU context and weights |
-| [client/scripts/copy-ort.mjs](client/scripts/copy-ort.mjs) | Vendors onnxruntime's WASM so MV3 never fetches code remotely |
+| [client/src/scripts/copy-ort.mjs](client/scripts/copy-ort.mjs) | Vendors onnxruntime's WASM so MV3 never fetches code remotely |
 | [client/src/offscreen/main.ts](client/src/offscreen/main.ts) | Offscreen host — the SW cannot own a GPU context |
-| [client/src/background/index.ts](client/src/background/index.ts) | Orchestrator: the escalation ladder lives here |
+| [client/src/background/index.ts](client/src/background/index.ts) | Orchestrator: query planning, sub-objective progression, escalation ladder |
 | [client/src/network/ws-client.ts](client/src/network/ws-client.ts) | One socket, bounded reconnect ladder, request correlation |
 | [client/src/content/value-hydrator.ts](client/src/content/value-hydrator.ts) | Resolves `USER_EMAIL` etc. from local storage |
 | [server/src/websocket/handler.ts](server/src/websocket/handler.ts) | Envelope validation, rate limit, latency budget |
@@ -211,8 +219,8 @@ fake socket rather than trusting the reading.
 ## Verification status
 
 ```
-client: 81 passed, 2 skipped   (vitest, jsdom)
-server:  8 passed              (vitest)
+client: 129 passed, 2 skipped  (vitest, jsdom)
+server: 8 passed               (vitest)
 tsc --noEmit: clean in both workspaces
 vite build:   extension bundles; copy:ort vendors 20.6 MB of ORT WASM into dist/ort/
 smoke:        WS round trip 4-5 ms with VLM_PROVIDER=heuristic
