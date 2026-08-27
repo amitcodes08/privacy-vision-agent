@@ -347,6 +347,7 @@ interface StepResult {
   action: AgentAction;
   preDom: ScrubbedDom;
   postDom: ScrubbedDom;
+  observed: boolean;
 }
 
 async function step(tabId: number, goal: string, history: AgentAction[], settings: Settings, taskMemory: TaskMemory): Promise<StepResult> {
@@ -389,7 +390,7 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
       if (corroborated.done && corroborated.confidence >= HIGH_CONFIDENCE) {
         logger.info('local', `vlm done corroborated by dom (${corroborated.reason}); stopping`);
         status.localDecisions++;
-        return { action: decision.action, preDom: dom, postDom: dom };
+        return { action: decision.action, preDom: dom, postDom: dom, observed: true };
       }
       if (!corroborated.done) {
         // DOM contradicts — treat as if the VLM did not decide.
@@ -400,12 +401,12 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
         decision = null;
       } else {
         status.localDecisions++;
-        return { action: decision.action, preDom: dom, postDom: dom };
+        return { action: decision.action, preDom: dom, postDom: dom, observed: true };
       }
     } else {
       status.localDecisions++;
       const applied = await applyDecision(tabId, decision, dom);
-      return { action: applied.action, preDom: dom, postDom: applied.postDom };
+      return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom, observed: applied.observed };
     }
   }
 
@@ -421,7 +422,7 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
     if (planned.confidence >= Math.max(settings.confidenceThreshold, 0.60) && planned.action.action !== 'escalate') {
       status.heuristicDecisions++;
       const applied = await applyDecision(tabId, planned, dom);
-      return { action: applied.action, preDom: dom, postDom: applied.postDom };
+      return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom, observed: applied.observed };
     }
   }
 
@@ -436,10 +437,10 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
       else status.localDecisions++;
       logger.info('escalate', `${escalationDown ? 'server unreachable' : 'disabled'}; acting on the best on-device decision`);
       const applied = await applyDecision(tabId, fallback, dom);
-      return { action: applied.action, preDom: dom, postDom: applied.postDom };
+      return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom, observed: applied.observed };
     }
     logger.warn('escalate', 'unavailable and nothing actionable on-device; stopping');
-    return { action: { action: 'done', summary: 'low confidence and no escalation available' }, preDom: dom, postDom: dom };
+    return { action: { action: 'done', summary: 'low confidence and no escalation available' }, preDom: dom, postDom: dom, observed: true };
   }
 
   const rawFrame = await frame();
@@ -474,7 +475,7 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
     const cloudDecision = sanitiseCloudAction(response.decision);
     logger.info('escalate', `cloud decision ${cloudDecision.action.action}`, response.rationale);
     const applied = await applyDecision(tabId, cloudDecision, dom);
-    return { action: applied.action, preDom: dom, postDom: applied.postDom };
+    return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom, observed: applied.observed };
   } catch (err) {
     escalationFailures++;
     if (escalationFailures >= MAX_ESCALATION_FAILURES) {
@@ -488,9 +489,9 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
       if (fallback.source === 'heuristic') status.heuristicDecisions++;
       else status.localDecisions++;
       const applied = await applyDecision(tabId, fallback, dom);
-      return { action: applied.action, preDom: dom, postDom: applied.postDom };
+      return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom, observed: applied.observed };
     }
-    return { action: { action: 'done', summary: 'no decision available on-device and escalation failed' }, preDom: dom, postDom: dom };
+    return { action: { action: 'done', summary: 'no decision available on-device and escalation failed' }, preDom: dom, postDom: dom, observed: true };
   }
 }
 
@@ -531,31 +532,119 @@ function repeatedTail(history: readonly AgentAction[]): number {
 async function applyDecision(
   tabId: number,
   decision: AgentDecision,
-  preDom: ScrubbedDom,
-): Promise<{ action: AgentAction; postDom: ScrubbedDom }> {
+  initialPreDom: ScrubbedDom,
+): Promise<{ action: AgentAction; preDom: ScrubbedDom; postDom: ScrubbedDom; observed: boolean }> {
   status.lastDecision = decision;
-  const action = decision.action;
+  let action = decision.action;
   if (action.action === 'done' || action.action === 'escalate' || action.action === 'invalid') {
-    return { action, postDom: preDom };
-  }
-  
-  const res = await execute(tabId, action);
-  if (!res.ok) {
-    logger.warn('execute', `${action.action} failed`, res.error);
-    return { action: { action: 'invalid', reason: res.error || 'execution failed' }, postDom: preDom };
+    return { action, preDom: initialPreDom, postDom: initialPreDom, observed: true };
   }
 
-  // Adaptive settlement for state-changing actions
-  let post = await scrape(tabId);
-  if (action.action === 'click' || action.action === 'fill' || action.action === 'navigate') {
-    if (fingerprint(preDom) === fingerprint(post.dom)) {
-       // State unchanged immediately, give it a short time to settle
-       await sleep(400);
-       post = await scrape(tabId);
+  // Safe pre-execution snapshot: avoid unhandled rejection if tab navigated or disconnected during inference
+  let immediatePreDom = initialPreDom;
+  try {
+    const preScrape = await scrape(tabId);
+    immediatePreDom = preScrape.dom;
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    logger.warn('execute', `pre-execution scrape failed: ${errorMsg}`);
+    return {
+      action: { action: 'invalid', reason: errorMsg || 'tab unreachable before execution' },
+      preDom: initialPreDom,
+      postDom: initialPreDom,
+      observed: false,
+    };
+  }
+
+  // Reconcile stale selectors if DOM updated during inference
+  if ('selector' in action && action.selector && fingerprint(initialPreDom) !== fingerprint(immediatePreDom)) {
+    const origNode = initialPreDom.nodes.find((n) => n.selector === action.selector);
+    const targetNode = immediatePreDom.nodes.find((n) => n.selector === action.selector);
+
+    const isSameElement =
+      origNode &&
+      targetNode &&
+      origNode.tag === targetNode.tag &&
+      (origNode.name === targetNode.name || origNode.label === targetNode.label || origNode.text === targetNode.text);
+
+    if (!isSameElement && origNode) {
+      // Find all candidates in the updated DOM matching the original node's key semantic attributes
+      const candidates = immediatePreDom.nodes.filter(
+        (n) =>
+          n.tag === origNode.tag &&
+          ((origNode.label && n.label === origNode.label) ||
+           (origNode.name && n.name === origNode.name) ||
+           (origNode.placeholder && n.placeholder === origNode.placeholder) ||
+           (origNode.text && n.text === origNode.text)),
+      );
+
+      if (candidates.length === 1) {
+        logger.info('execute', `reconciled stale selector ${action.selector} -> ${candidates[0].selector}`);
+        action = { ...action, selector: candidates[0].selector };
+      } else if (candidates.length > 1 && origNode.box) {
+        // Disambiguate by spatial proximity if bounding box is known
+        const closest = candidates.slice().sort((a, b) => {
+          const distA = Math.hypot((a.box?.x ?? 0) - origNode.box!.x, (a.box?.y ?? 0) - origNode.box!.y);
+          const distB = Math.hypot((b.box?.x ?? 0) - origNode.box!.x, (b.box?.y ?? 0) - origNode.box!.y);
+          return distA - distB;
+        })[0];
+        logger.info('execute', `disambiguated stale selector ${action.selector} -> ${closest.selector}`);
+        action = { ...action, selector: closest.selector };
+      } else {
+        logger.warn('execute', `stale selector ${action.selector} has ${candidates.length} matches in updated DOM; rejecting for safety`);
+        return {
+          action: { action: 'invalid', reason: `target element ambiguous or vanished after DOM change (${action.selector})` },
+          preDom: immediatePreDom,
+          postDom: immediatePreDom,
+          observed: true,
+        };
+      }
     }
   }
 
-  return { action, postDom: post.dom };
+  const res = await execute(tabId, action);
+  if (!res.ok) {
+    logger.warn('execute', `${action.action} failed`, res.error);
+    return { action: { action: 'invalid', reason: res.error || 'execution failed' }, preDom: immediatePreDom, postDom: immediatePreDom, observed: true };
+  }
+
+  // Adaptive settlement for state-changing actions
+  await sleep(100);
+  let postDom: ScrubbedDom | undefined;
+
+  if (action.action === 'navigate') {
+    await waitForTabReady(tabId);
+    await ensureContentScript(tabId);
+  }
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      let post = await scrape(tabId);
+      if (action.action === 'click' || action.action === 'fill' || action.action === 'navigate') {
+        if (fingerprint(immediatePreDom) === fingerprint(post.dom) && attempt < 3) {
+          await sleep(350);
+          continue;
+        }
+      }
+      postDom = post.dom;
+      break;
+    } catch (err) {
+      logger.warn('execute', `post-execution scrape attempt ${attempt} failed: ${err instanceof Error ? err.message : String(err)}`);
+      if (attempt < 3) {
+        await waitForTabReady(tabId, 2000);
+        await ensureContentScript(tabId);
+        await sleep(200);
+      }
+    }
+  }
+
+  const observed = postDom !== undefined;
+  return {
+    action,
+    preDom: immediatePreDom,
+    postDom: postDom ?? immediatePreDom,
+    observed,
+  };
 }
 
 
@@ -640,25 +729,34 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
         break;
       }
 
-      // Post-step completion check
-      const postSignal = checkTermination({
-        goal,
-        dom: result.postDom,
-        lastAction: action,
-        history,
-        prevDom: result.preDom,
-        taskMemory,
-      });
-      if (postSignal.done && postSignal.confidence >= HIGH_CONFIDENCE) {
-        logger.info('termination', `post-step exit after step ${i + 1}: ${postSignal.reason}`);
-        history.push({ action: 'done', summary: postSignal.reason });
-        break;
+      // Post-step completion check only if post-action DOM was observed
+      if (result.observed) {
+        const postSignal = checkTermination({
+          goal,
+          dom: result.postDom,
+          lastAction: action,
+          history,
+          prevDom: result.preDom,
+          taskMemory,
+        });
+        if (postSignal.done && postSignal.confidence >= HIGH_CONFIDENCE) {
+          logger.info('termination', `post-step exit after step ${i + 1}: ${postSignal.reason}`);
+          history.push({ action: 'done', summary: postSignal.reason });
+          break;
+        }
       }
 
       // Measure exact DOM change caused by THIS action alone
       const isActionWaitOrDone = action.action === 'wait' || action.action === 'escalate';
-      const stateChanged = fingerprint(result.preDom) !== fingerprint(result.postDom);
-      let resultCategory: ActionResultCategory = action.action === 'invalid' ? 'failed' : (stateChanged ? 'state_changed' : (isActionWaitOrDone ? 'uncertain' : 'no_change'));
+      let resultCategory: ActionResultCategory;
+      if (action.action === 'invalid') {
+        resultCategory = 'failed';
+      } else if (!result.observed) {
+        resultCategory = 'uncertain';
+      } else {
+        const stateChanged = fingerprint(result.preDom) !== fingerprint(result.postDom);
+        resultCategory = stateChanged ? 'state_changed' : (isActionWaitOrDone ? 'uncertain' : 'no_change');
+      }
 
       taskMemory.lastAction = { action, result: resultCategory };
 
@@ -719,7 +817,7 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
         invalidCount = 0;
       }
 
-      if (action.action !== 'invalid' && !stateChanged && !isActionWaitOrDone && repeatedTail(history) >= 2) {
+      if (action.action !== 'invalid' && resultCategory === 'no_change' && !isActionWaitOrDone && repeatedTail(history) >= 2) {
         logger.warn('agent', `action ${domFingerprint(action)} produced no state change; stopping to prevent loop`);
         break;
       }
