@@ -101,6 +101,8 @@ async function perform(action: AgentAction): Promise<string> {
     case 'escalate':
     case 'done':
       return action.action;
+    case 'invalid':
+      throw new Error(`invalid action: ${action.reason}`);
   }
 }
 

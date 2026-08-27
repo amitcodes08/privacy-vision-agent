@@ -16,6 +16,7 @@ export interface PlanInput {
   goal: string;
   dom: ScrubbedDom;
   history?: AgentAction[];
+  taskMemory?: import('@shared/types').TaskMemory;
 }
 
 const STOPWORDS = new Set([
@@ -23,7 +24,7 @@ const STOPWORDS = new Set([
   'you', 'please', 'can', 'could', 'would', 'want', 'need', 'get', 'got', 'let',
   'its', 'his', 'her', 'their', 'has', 'have', 'was', 'were', 'are', 'but',
   'not', 'all', 'any', 'out', 'off', 'now', 'page', 'site', 'website', 'button',
-  'link', 'field', 'box', 'first', 'next', 'also', 'again',
+  'link', 'field', 'box', 'first', 'next', 'also', 'again', 'more', 'see', 'down', 'up',
   // Pure operation verbs. These are already read as *intent* below, and as
   // content keywords they are noise: "click on package.json" scored every
   // element for the word "click". Words that double as real labels — accept,
@@ -70,7 +71,7 @@ const FILLABLE = new Set(['input', 'textarea']);
 const NON_TEXT_INPUT = new Set(['checkbox', 'radio', 'file', 'range', 'color', 'submit', 'button', 'reset', 'image', 'hidden']);
 
 export function planLocally(input: PlanInput): AgentDecision {
-  const { goal, dom, history = [] } = input;
+  const { goal, dom } = input;
   const ranking = rankCandidates(input);
   const best = ranking.candidates[0];
 
@@ -86,12 +87,10 @@ export function planLocally(input: PlanInput): AgentDecision {
     }
     return {
       action: {
-        action: 'done',
-        summary: history.length
-          ? 'no remaining element matches the goal'
-          : 'no element on this page matches the goal',
+        action: 'invalid',
+        reason: 'NO_ACTIONABLE_TARGET',
       },
-      confidence: history.length ? 0.55 : 0.3,
+      confidence: 0,
       source: 'heuristic',
     };
   }
@@ -132,14 +131,15 @@ export interface Ranking {
  * the planning; this only decides what it gets to look at.
  */
 export function rankCandidates(input: PlanInput): Ranking {
-  const { goal, dom, history = [] } = input;
-  const wanted = expand(tokenize(goal));
+  const { goal, dom, history = [], taskMemory } = input;
+  const targetGoal = taskMemory?.currentObjective || goal;
+  const wanted = expand(tokenize(targetGoal));
 
   const intent: Intent = {
-    fill: INTENT.fill.test(goal),
-    click: INTENT.click.test(goal),
-    scroll: INTENT.scroll.test(goal),
-    navigate: INTENT.navigate.test(goal),
+    fill: INTENT.fill.test(targetGoal),
+    click: INTENT.click.test(targetGoal),
+    scroll: INTENT.scroll.test(targetGoal),
+    navigate: INTENT.navigate.test(targetGoal),
   };
 
   // A selector we already acted on twice is a loop; stop preferring it.
@@ -147,6 +147,12 @@ export function rankCandidates(input: PlanInput): Ranking {
   for (const h of history) {
     const sel = 'selector' in h ? h.selector : undefined;
     if (sel) acted.set(sel, (acted.get(sel) ?? 0) + 1);
+  }
+  // Heavily penalize targets we just attempted that resulted in no state change.
+  if (input.taskMemory?.attemptedTargets) {
+    for (const sel of input.taskMemory.attemptedTargets) {
+      acted.set(sel, (acted.get(sel) ?? 0) + 2);
+    }
   }
 
   const candidates = dom.nodes
@@ -172,6 +178,27 @@ function scoreToConfidence(score: number, breadth: number): number {
   return Math.min(0.78, 0.34 + score / (6 + breadth * 1.4));
 }
 
+function isStateChanger(n: ScrubbedNode): boolean {
+  if (n.tag === 'button') return true;
+  if (n.role && ['button', 'submit', 'checkbox', 'menuitem', 'option'].includes(n.role)) return true;
+  if (n.tag === 'input' && ['submit', 'button', 'reset', 'checkbox', 'radio'].includes(n.type || '')) return true;
+  return false;
+}
+
+function isNavigator(n: ScrubbedNode): boolean {
+  if (n.tag === 'a') return true;
+  if (n.role === 'link') return true;
+  return false;
+}
+
+const ACTION_VERBS = /\b(add|submit|buy|checkout|delete|remove|clear|save|update|apply|accept|agree)\b/i;
+function containsVerb(text: string): boolean {
+  return ACTION_VERBS.test(text);
+}
+
+const describe = (n: ScrubbedNode): string =>
+  (n.label ?? n.text ?? n.placeholder ?? n.name ?? n.tag).slice(0, 40);
+
 function scoreNode(
   n: ScrubbedNode,
   wanted: readonly string[],
@@ -196,14 +223,40 @@ function scoreNode(
 
   let score = keyword;
   const kind = kindOf(n);
+  const isChanger = isStateChanger(n);
+  const isNav = isNavigator(n);
+  const hasVerb = containsVerb(describe(n));
 
   // Intent alignment. Deliberately gentle — a keyword match on the wrong kind
   // of element is still better than escalating.
   if (intent.fill && kind === 'fill') score += 6;
   if (intent.fill && kind === 'click') score -= 2;
-  if (intent.click && kind === 'click') score += 6;
+
+  if (intent.click) {
+    if (isChanger) {
+      score += 6;
+    } else if (isNav) {
+      if (hasVerb) {
+        score += 4; // Actionable link (e.g. "Add to Cart")
+      } else {
+        score -= 4; // Heavily penalize pure navigation links for state-changing intents
+      }
+    } else if (kind === 'click') {
+      score += 4; // Fallback for other clickables
+    }
+  } else if (intent.navigate) {
+    if (isNav) {
+      score += 6;
+    } else if (isChanger) {
+      score -= 2;
+    } else if (kind === 'click') {
+      score += 2;
+    }
+  } else {
+    if (!intent.fill && kind !== 'other') score += 2;
+  }
+
   if (intent.click && kind === 'fill') score -= 2;
-  if (!intent.fill && !intent.click && kind !== 'other') score += 2;
 
   // Prefer things a user can actually operate.
   if (kind === 'other') score -= 3;
@@ -260,7 +313,7 @@ export function inferValueType(n: ScrubbedNode): 'USER_EMAIL' | 'USER_FULL_NAME'
  * Pull the quoted or trailing phrase out of the goal for a literal fill:
  * `search for "wireless mouse"` -> `wireless mouse`.
  */
-function literalFor(goal: string): string | undefined {
+export function literalFor(goal: string): string | undefined {
   const quoted = goal.match(/["“']([^"”']{2,80})["”']/);
   if (quoted?.[1]) return quoted[1].trim();
   const after = goal.match(/\b(?:search(?:\s+for)?|type|enter|fill(?:\s+in)?|write|query|look\s+for)\b[:\s]+(.{2,80})$/i);
@@ -287,8 +340,7 @@ function haystack(n: ScrubbedNode): string {
     .toLowerCase();
 }
 
-const describe = (n: ScrubbedNode): string =>
-  (n.label ?? n.text ?? n.placeholder ?? n.name ?? n.tag).slice(0, 40);
+
 
 export function tokenize(goal: string): string[] {
   return (goal.toLowerCase().match(/[a-z][a-z0-9-]{1,}/g) ?? []).filter((w) => w.length > 2 && !STOPWORDS.has(w));
