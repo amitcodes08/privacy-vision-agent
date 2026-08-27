@@ -1,34 +1,43 @@
 # Privacy Vision Agent
 
 A client-dominant hybrid vision agent. A quantized VLM runs **inside the
-browser on WebGPU** and acts on the page with zero network calls. When the
-local model is not confident enough, a deterministic **on-device planner**
-gets the next shot. Only when *both* on-device paths come up short does the
-extension escalate — and then it sends a **redacted** screenshot plus a
-**scrubbed** DOM to a WebSocket server, which returns a *structural* command
-whose private values are re-hydrated locally.
+browser on WebGPU** and decides what to do with zero network calls. A
+deterministic keyword ranker keeps it honest: it picks which page elements the
+model gets to look at, and afterwards corroborates whatever the model chose.
+Only when the model produces nothing usable does the extension escalate — and
+then it sends a **redacted** screenshot plus a **scrubbed** DOM to a WebSocket
+server, which returns a *structural* command whose private values are
+re-hydrated locally.
 
 ```
 content script ──scrubbed DOM + sensitive boxes──┐
                                                  ▼
-captureVisibleTab ──raw frame──► offscreen ► WebGPU worker ──► action   (1: local VLM)
+                          keyword ranker ──picks the elements──┐
+                                    │                          ▼
+captureVisibleTab ──raw frame──► offscreen ► WebGPU worker ► VLM plans the action
+                                                               │
+                                          ranker corroborates ─┤   (agreement raises confidence)
+                                                               ▼
+                                                             action              (1: local, no network)
                                     │
-                        confidence < threshold
+                       no usable model output
                                     ▼
-                       on-device keyword planner ──► action            (2: local, still no network)
+                        ranker plans it instead ──► action                       (2: local, no network)
                                     │
-                        confidence < threshold
+                        VLM unsure about a real element
                                     ▼
                       canvas redactor (black boxes)
                                     ▼
                      ws://localhost:8080 ► cloud VLM
                                     ▼
-                 {action, selector, valueType} ► local hydration ► action  (3: last resort)
+                 {action, selector, valueType} ► local hydration ► action        (3: last resort)
 ```
 
-Tier 2 is what keeps the server idle. Without it, "the local model is unsure"
-meant "upload a frame", so a small VLM having a bad day turned into a network
-round trip on every single step.
+**The VLM is the planner.** The ranker never overrides a model that actually
+chose an element — a keyword match is not better evidence than a vision model
+that read the page, and tier 3 exists for exactly that case. The ranker plans
+alone only in tier 2, when there is no working model to plan with and the
+alternative is nothing at all.
 
 ## Layout
 
@@ -40,8 +49,8 @@ round trip on every single step.
 | [client/src/privacy/canvas-redactor.ts](client/src/privacy/canvas-redactor.ts) | Destructive box painting → JPEG base64 |
 | [client/src/ai/models.ts](client/src/ai/models.ts) | Model catalogue + **per-graph** quantization |
 | [client/src/ai/model-loader.ts](client/src/ai/model-loader.ts) | Transformers.js v3 load + generate |
-| [client/src/ai/decision-parser.ts](client/src/ai/decision-parser.ts) | Model text → action, with selector repair + confidence |
-| [client/src/ai/local-planner.ts](client/src/ai/local-planner.ts) | Tier 2: deterministic on-device planner, no model, no network |
+| [client/src/ai/decision-parser.ts](client/src/ai/decision-parser.ts) | Prompt building, model text → action, selector repair + confidence |
+| [client/src/ai/local-planner.ts](client/src/ai/local-planner.ts) | Keyword ranker: grounds the prompt, corroborates, and plans when there is no model |
 | [client/src/ai/vlm-worker.ts](client/src/ai/vlm-worker.ts) | Worker that owns the WebGPU context and weights |
 | [client/src/offscreen/main.ts](client/src/offscreen/main.ts) | Offscreen host — the SW cannot own a GPU context |
 | [client/src/background/index.ts](client/src/background/index.ts) | Orchestrator: the escalation ladder lives here |

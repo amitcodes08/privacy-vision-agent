@@ -16,6 +16,7 @@ import {
 } from '@huggingface/transformers';
 import type { AgentAction, AgentDecision, ScrubbedDom } from '@shared/types';
 import { buildPrompt, parseAction } from './decision-parser';
+import { rankCandidates } from './local-planner';
 import { DEFAULT_MODEL_KEY, MODEL_REGISTRY, type Dtype, type DtypeMap, type ModelSpec } from './models';
 
 export { DEFAULT_MODEL_KEY, MODEL_REGISTRY, type ModelSpec };
@@ -123,7 +124,11 @@ export async function generateDecision(args: GenerateArgs): Promise<AgentDecisio
   const processor = loaded.processor as unknown as ProcessorView;
   const model = loaded.model as unknown as ModelView;
 
-  const prompt = buildPrompt(goal, dom, history);
+  // One ranking serves both jobs: choosing which elements the model gets to
+  // see, and afterwards corroborating whichever one it picked.
+  const ranking = rankCandidates({ goal, dom, history });
+
+  const prompt = buildPrompt(goal, dom, history, ranking);
   const messages = [{ role: 'user', content: [{ type: 'image' }, { type: 'text', text: prompt }] }];
   const text = processor.apply_chat_template(messages, { add_generation_prompt: true });
   const inputs = await processor(text, [image], { do_image_splitting: false });
@@ -131,7 +136,7 @@ export async function generateDecision(args: GenerateArgs): Promise<AgentDecisio
   const output = await model.generate({ ...inputs, max_new_tokens: maxNewTokens, do_sample: false });
 
   const raw = decodeCompletion(processor, inputs, output);
-  const { action, confidence } = parseAction(raw, dom);
+  const { action, confidence } = parseAction(raw, dom, { goal, history, ranking });
   return {
     action,
     confidence,

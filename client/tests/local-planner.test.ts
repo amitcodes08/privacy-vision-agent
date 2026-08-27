@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AgentAction, ScrubbedDom, ScrubbedNode } from '@shared/types';
-import { planLocally } from '~/ai/local-planner';
+import { planLocally, rankCandidates, rankOf } from '~/ai/local-planner';
 
 const node = (over: Partial<ScrubbedNode> & { id: number; selector: string }): ScrubbedNode => ({
   tag: 'button',
@@ -96,5 +96,46 @@ describe('planLocally', () => {
     const blog = dom([node({ id: 0, selector: '#blog', tag: 'a', text: 'Blog' })]);
     const d = planLocally({ goal: 'log in to my account', dom: blog });
     expect(d.action.action).toBe('done');
+  });
+});
+
+describe('rankCandidates', () => {
+  it('ranks the goal-relevant element first regardless of DOM position', () => {
+    const big = dom([
+      ...Array.from({ length: 40 }, (_, i) => node({ id: i, selector: `#f${i}`, text: `Item ${i}` })),
+      node({ id: 40, selector: '#accept', text: 'Accept all cookies' }),
+    ]);
+    const { candidates } = rankCandidates({ goal: 'accept cookies', dom: big });
+    expect(candidates[0]?.node.selector).toBe('#accept');
+  });
+
+  it('excludes disabled and invisible nodes from the ranking', () => {
+    const mixed = dom([
+      node({ id: 0, selector: '#a', text: 'Accept cookies', disabled: true }),
+      node({ id: 1, selector: '#b', text: 'Accept cookies', visible: false }),
+      node({ id: 2, selector: '#c', text: 'Accept cookies' }),
+    ]);
+    const { candidates } = rankCandidates({ goal: 'accept cookies', dom: mixed });
+    expect(candidates.map((c) => c.node.selector)).toEqual(['#c']);
+  });
+
+  it('reports nothing when no element mentions the goal', () => {
+    const { candidates } = rankCandidates({ goal: 'quarterly tax report', dom: CONSENT });
+    expect(candidates).toHaveLength(0);
+  });
+
+  it('rankOf locates a selector and returns undefined for an unranked one', () => {
+    const ranking = rankCandidates({ goal: 'accept cookies', dom: CONSENT });
+    expect(rankOf(ranking, '#accept')).toBe(0);
+    expect(rankOf(ranking, '#more')).toBeUndefined();
+  });
+
+  it('demotes an element already acted on, without dropping it from the page', () => {
+    const goal = 'accept cookies';
+    const fresh = rankCandidates({ goal, dom: CONSENT }).candidates[0]?.score ?? 0;
+    const stale =
+      rankCandidates({ goal, dom: CONSENT, history: [{ action: 'click', selector: '#accept' }] })
+        .candidates.find((c) => c.node.selector === '#accept')?.score ?? 0;
+    expect(stale).toBeLessThan(fresh);
   });
 });

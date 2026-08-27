@@ -11,23 +11,58 @@
  * recover here is one escalation that does not happen.
  */
 import { type AgentAction, type ScrubbedDom, type ScrubbedNode, type ValueToken } from '@shared/types';
-import { inferValueType } from './local-planner';
+import { inferValueType, rankCandidates, rankOf, type Ranking } from './local-planner';
 
-/** Compact, token-cheap page description for the local model. */
-export function buildPrompt(goal: string, dom: ScrubbedDom, history: AgentAction[] = []): string {
-  const lines = dom.nodes.slice(0, 40).map((n) => {
-    const bits = [
-      n.tag,
-      n.type && `type=${n.type}`,
-      n.label && `label="${trunc(n.label)}"`,
-      n.text && `text="${trunc(n.text)}"`,
-      n.value && `value="${trunc(n.value)}"`,
-      n.disabled && 'disabled',
-    ]
-      .filter(Boolean)
-      .join(' ');
-    return `${n.id}: ${bits}`;
-  });
+/** How many elements the prompt may list. Small models degrade with long lists. */
+const PROMPT_BUDGET = 36;
+/** Ranked elements guaranteed a slot, however long the page is. */
+const GUARANTEED_RELEVANT = 18;
+
+/**
+ * Compact, token-cheap page description for the local model.
+ *
+ * Element choice is the whole game here. `dom.nodes` holds up to
+ * `maxDomNodes` (120) entries, so slicing the first N in DOM order could omit
+ * the one element the goal is about entirely — the model then had no way to
+ * answer correctly and looked "unsure" for a reason that was our fault. The
+ * ranker guarantees goal-relevant elements a slot; the rest of the budget is
+ * page context.
+ *
+ * Emission stays in DOM order so the list lines up with the screenshot the
+ * model is looking at. Relevance is a marker, not a reordering — the model
+ * still decides.
+ */
+export function buildPrompt(
+  goal: string,
+  dom: ScrubbedDom,
+  history: AgentAction[] = [],
+  ranking?: Ranking,
+): string {
+  const ranked = ranking ?? rankCandidates({ goal, dom, history });
+  const relevant = new Set(ranked.candidates.slice(0, GUARANTEED_RELEVANT).map((c) => c.node.id));
+
+  const chosen = new Map<number, ScrubbedNode>();
+  for (const c of ranked.candidates.slice(0, GUARANTEED_RELEVANT)) chosen.set(c.node.id, c.node);
+  for (const n of dom.nodes) {
+    if (chosen.size >= PROMPT_BUDGET) break;
+    if (n.visible && !n.disabled) chosen.set(n.id, n);
+  }
+
+  const lines = [...chosen.values()]
+    .sort((a, b) => a.id - b.id)
+    .map((n) => {
+      const bits = [
+        n.tag,
+        n.type && `type=${n.type}`,
+        n.label && `label="${trunc(n.label)}"`,
+        n.text && `text="${trunc(n.text)}"`,
+        n.value && `value="${trunc(n.value)}"`,
+      ]
+        .filter(Boolean)
+        .join(' ');
+      return `${n.id}: ${bits}${relevant.has(n.id) ? '  <-- mentions your goal' : ''}`;
+    });
+
   const past = history
     .slice(-3)
     .map((h) => ('selector' in h ? `${h.action}(${h.selector})` : h.action))
@@ -42,7 +77,7 @@ export function buildPrompt(goal: string, dom: ScrubbedDom, history: AgentAction
     `PAGE: ${trunc(dom.title, 80)}`,
     'ELEMENTS (id: description):',
     lines.join('\n'),
-    past && `ALREADY DONE: ${past}`,
+    past && `ALREADY DONE: ${past} — do not repeat these.`,
     '',
     'Answer with one JSON object and nothing else.',
     'Keys: "action" (one of click, fill, scroll, done), "id" (an element id from the list above),',
@@ -68,12 +103,24 @@ const VALUE_TOKENS = new Set<ValueToken>([
   'USER_EMAIL', 'USER_FULL_NAME', 'USER_PHONE', 'USER_ADDRESS', 'USER_PASSWORD', 'OTP_CODE', 'LITERAL',
 ]);
 
+export interface ParseContext {
+  /** Enables the corroboration bonus below. */
+  goal?: string;
+  history?: AgentAction[];
+  /** Reuse the ranking already computed for the prompt. */
+  ranking?: Ranking;
+}
+
 /**
  * Parse the model's text into an action and score how much we trust it.
- * The score is structural, not probabilistic: a selector that does not
- * exist on the page is worthless no matter how confident the logits were.
+ * The score is structural, not probabilistic: an element that does not exist
+ * on the page is worthless no matter how confident the logits were.
  */
-export function parseAction(raw: string, dom: ScrubbedDom): { action: AgentAction; confidence: number } {
+export function parseAction(
+  raw: string,
+  dom: ScrubbedDom,
+  ctx: ParseContext = {},
+): { action: AgentAction; confidence: number } {
   const json = extractJson(raw);
   if (!json || typeof json !== 'object') {
     return { action: { action: 'escalate', reason: 'no JSON in local output' }, confidence: 0 };
@@ -98,7 +145,18 @@ export function parseAction(raw: string, dom: ScrubbedDom): { action: AgentActio
   const node = findNode(dom, action);
   if (node?.disabled) confidence -= 0.25;
   if (action.action === 'fill' && !action.valueType) confidence -= 0.2;
-  if (raw.length > 600) confidence -= 0.1;
+
+  // Corroboration: the keyword ranker looked at the same page independently.
+  // When it would have picked the same element, that is real evidence the
+  // model read the page rather than guessing — and it is what keeps a correct
+  // but hesitant local decision from becoming a network round trip. The model
+  // still chose; this only vouches for the choice.
+  if (ctx.goal && node) {
+    const ranking = ctx.ranking ?? rankCandidates({ goal: ctx.goal, dom, history: ctx.history ?? [] });
+    const at = rankOf(ranking, node.selector);
+    if (at === 0) confidence += 0.12;
+    else if (at !== undefined && at < 5) confidence += 0.06;
+  }
 
   return { action, confidence: Math.max(0, Math.min(1, confidence)) };
 }

@@ -131,7 +131,8 @@ async function handleInference(
     if (elapsed > LATENCY_BUDGET_MS) console.warn(`[ws] latency budget exceeded: ${elapsed}ms`);
     send(ws, envelope('INFERENCE_RESPONSE', result, requestId));
   } catch (err) {
-    stats.errors++;
+    // `fail` already counts the error; counting it here too double-reported
+    // every model failure in /stats.
     fail(ws, 'MODEL_ERROR', err instanceof Error ? err.message : String(err), requestId);
   }
 }

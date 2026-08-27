@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ScrubbedDom, ScrubbedNode } from '@shared/types';
-import { extractJson, parseAction } from '~/ai/decision-parser';
+import { buildPrompt, extractJson, parseAction } from '~/ai/decision-parser';
 
 const node = (over: Partial<ScrubbedNode> & { id: number; selector: string }): ScrubbedNode => ({
   tag: 'button',
@@ -118,5 +118,70 @@ describe('parseAction', () => {
   it('falls back to a viewport scroll when no element matches', () => {
     const { action } = parseAction('{"action":"scroll"}', DOM);
     expect(action).toMatchObject({ action: 'scroll', deltaY: 640 });
+  });
+});
+
+describe('parseAction corroboration', () => {
+  it('raises confidence when the ranker would have picked the same element', () => {
+    const bare = parseAction('{"action":"click","id":0}', DOM).confidence;
+    const vouched = parseAction('{"action":"click","id":0}', DOM, { goal: 'accept cookies' }).confidence;
+    expect(vouched).toBeGreaterThan(bare);
+  });
+
+  it('does not vouch for an element unrelated to the goal', () => {
+    const bare = parseAction('{"action":"click","id":2}', DOM).confidence;
+    const same = parseAction('{"action":"click","id":2}', DOM, { goal: 'accept cookies' }).confidence;
+    expect(same).toBe(bare);
+  });
+
+  it('still refuses an unresolvable element however relevant the goal', () => {
+    const { confidence } = parseAction('{"action":"click","selector":"#nope"}', DOM, { goal: 'accept cookies' });
+    expect(confidence).toBeLessThan(0.2);
+  });
+});
+
+describe('buildPrompt element selection', () => {
+  /** 60 filler buttons, then the one element the goal is actually about. */
+  const big: ScrubbedDom = {
+    ...DOM,
+    nodes: [
+      ...Array.from({ length: 60 }, (_, i) => node({ id: i, selector: `#filler-${i}`, text: `Item ${i}` })),
+      node({ id: 60, selector: '#accept-cookies', text: 'Accept all cookies' }),
+    ],
+  };
+
+  it('includes a goal-relevant element that sits far past a naive slice', () => {
+    const prompt = buildPrompt('accept cookies', big);
+    expect(prompt).toContain('60:');
+    expect(prompt).toContain('Accept all cookies');
+  });
+
+  it('marks relevant elements so the model can find them', () => {
+    expect(buildPrompt('accept cookies', big)).toMatch(/60:.*mentions your goal/);
+  });
+
+  it('stays within the element budget on a long page', () => {
+    const listed = buildPrompt('accept cookies', big)
+      .split('\n')
+      .filter((l) => /^\d+: /.test(l));
+    expect(listed.length).toBeLessThanOrEqual(36);
+  });
+
+  it('lists elements in DOM order so the list matches the screenshot', () => {
+    const ids = buildPrompt('accept cookies', big)
+      .split('\n')
+      .filter((l) => /^\d+: /.test(l))
+      .map((l) => Number(l.split(':')[0]));
+    expect(ids).toEqual([...ids].sort((a, b) => a - b));
+  });
+
+  it('tells the model not to repeat what it already did', () => {
+    const prompt = buildPrompt('accept cookies', big, [{ action: 'click', selector: '#filler-1' }]);
+    expect(prompt).toContain('do not repeat');
+  });
+
+  it('omits disabled elements entirely', () => {
+    expect(buildPrompt('pay now', DOM)).not.toContain('#disabled-btn');
+    expect(buildPrompt('pay now', DOM)).not.toMatch(/^3: /m);
   });
 });

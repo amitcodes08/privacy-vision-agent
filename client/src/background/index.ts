@@ -231,6 +231,15 @@ async function execute(tabId: number, action: AgentAction): Promise<{ ok: boolea
  * The loop
  * ---------------------------------------------------------------- */
 
+/**
+ * One observe-decide-act cycle.
+ *
+ * The local VLM is the planner. The deterministic ranker's job is to make sure
+ * the model can see the elements that matter (it picks the prompt's element
+ * list) and to corroborate what the model then chooses — both of which happen
+ * inside the worker. It only *plans* on its own when there is no working model
+ * to plan with, which is the one case where the alternative is nothing at all.
+ */
 async function step(tabId: number, goal: string, history: AgentAction[], settings: Settings): Promise<AgentAction> {
   const { dom, boxes, dpr } = await scrape(tabId);
   status.redactions += boxes.length;
@@ -266,27 +275,38 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
     return applyDecision(tabId, decision);
   }
 
-  // --- Path 2: on-device deterministic planner --------------------
-  // Runs before anything touches the network. This is what keeps a weak or
-  // missing local model from turning into a server round trip per step.
-  const planned = planLocally({ goal, dom, history });
-  logger.info('planner', `${planned.action.action} conf=${planned.confidence.toFixed(2)}`, reasonOf(planned));
-
-  const localBest = decision && decision.confidence > planned.confidence ? decision : planned;
-  if (localBest.confidence >= settings.confidenceThreshold && localBest.action.action !== 'escalate') {
-    if (localBest === planned) status.heuristicDecisions++;
-    else status.localDecisions++;
-    return applyDecision(tabId, localBest);
+  // --- Path 2: no usable model, so plan on-device -----------------
+  // Only when the VLM could not produce a decision at all: not loaded yet,
+  // errored, or emitted nothing parseable. A model that *did* choose an element
+  // and is merely hesitant is not overridden here — a keyword match is not
+  // better evidence than a vision model that read the page, and escalation
+  // exists precisely for that case.
+  const vlmUnusable = !decision || decision.confidence === 0;
+  const planned = vlmUnusable ? planLocally({ goal, dom, history }) : null;
+  if (planned) {
+    logger.info(
+      'planner',
+      `no usable vlm output; planner says ${planned.action.action} conf=${planned.confidence.toFixed(2)}`,
+      reasonOf(planned),
+    );
+    if (planned.confidence >= settings.confidenceThreshold && planned.action.action !== 'escalate') {
+      status.heuristicDecisions++;
+      return applyDecision(tabId, planned);
+    }
   }
+
+  const best = decision ?? planned;
 
   // --- Path 3: redact, then escalate -----------------------------
   if (!settings.allowEscalation) {
-    // Escalation is off, so take the best on-device guess rather than stalling
-    // — but only if it names a real element.
-    if (planned.action.action !== 'escalate' && planned.action.action !== 'done') {
-      status.heuristicDecisions++;
-      logger.info('escalate', 'disabled; acting on the on-device planner');
-      return applyDecision(tabId, planned);
+    // Escalation is off, so act on the best on-device guess rather than
+    // stalling — but only if it names a real element.
+    const fallback = pickActionable(decision, planned);
+    if (fallback) {
+      if (fallback === planned) status.heuristicDecisions++;
+      else status.localDecisions++;
+      logger.info('escalate', 'disabled; acting on the best on-device decision');
+      return applyDecision(tabId, fallback);
     }
     logger.warn('escalate', 'blocked by settings; stopping');
     return { action: 'done', summary: 'low confidence and escalation disabled' };
@@ -315,18 +335,20 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
       imageMime: redacted.mime,
       dom,
       history,
-      localConfidence: localBest.confidence,
-      localReason: reasonOf(localBest) ?? 'below threshold',
+      localConfidence: best?.confidence ?? 0,
+      localReason: (best && reasonOf(best)) ?? 'below threshold',
     });
     status.escalations++;
     logger.info('escalate', `cloud decision ${response.decision.action.action}`, response.rationale);
     return applyDecision(tabId, response.decision);
   } catch (err) {
     // The server is a convenience, not a dependency. Fall back on-device.
-    logger.warn('escalate', `failed: ${err instanceof Error ? err.message : String(err)}; using on-device planner`);
-    if (planned.action.action !== 'escalate') {
-      status.heuristicDecisions++;
-      return applyDecision(tabId, planned);
+    logger.warn('escalate', `failed: ${err instanceof Error ? err.message : String(err)}; falling back on-device`);
+    const fallback = pickActionable(decision, planned) ?? pickActionable(planLocally({ goal, dom, history }), null);
+    if (fallback) {
+      if (fallback.source === 'heuristic') status.heuristicDecisions++;
+      else status.localDecisions++;
+      return applyDecision(tabId, fallback);
     }
     return { action: 'done', summary: 'no decision available on-device and escalation failed' };
   }
@@ -338,6 +360,19 @@ const reasonOf = (d: AgentDecision): string | undefined => {
   if (a.action === 'done') return a.summary;
   return undefined;
 };
+
+/**
+ * The best decision that would actually do something, preferring the model's
+ * over the ranker's. `done`/`escalate` are not actions, so they do not count.
+ */
+function pickActionable(...candidates: (AgentDecision | null)[]): AgentDecision | null {
+  for (const c of candidates) {
+    if (!c) continue;
+    const kind = c.action.action;
+    if (kind !== 'escalate' && kind !== 'done') return c;
+  }
+  return null;
+}
 
 /** Identity of an action for loop detection — kind plus target, no reason text. */
 const fingerprint = (a: AgentAction): string =>

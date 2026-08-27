@@ -65,35 +65,13 @@ const NON_TEXT_INPUT = new Set(['checkbox', 'radio', 'file', 'range', 'color', '
 
 export function planLocally(input: PlanInput): AgentDecision {
   const { goal, dom, history = [] } = input;
-  const tokens = tokenize(goal);
-  const wanted = expand(tokens);
-
-  const intent = {
-    fill: INTENT.fill.test(goal),
-    click: INTENT.click.test(goal),
-    scroll: INTENT.scroll.test(goal),
-    navigate: INTENT.navigate.test(goal),
-  };
-
-  // A selector we already acted on twice is a loop; stop preferring it.
-  const acted = new Map<string, number>();
-  for (const h of history) {
-    const sel = 'selector' in h ? h.selector : undefined;
-    if (sel) acted.set(sel, (acted.get(sel) ?? 0) + 1);
-  }
-
-  const scored = dom.nodes
-    .filter((n) => !n.disabled && n.visible)
-    .map((n) => ({ node: n, score: scoreNode(n, wanted, intent, acted) }))
-    .filter((c) => c.score > 0)
-    .sort((a, b) => b.score - a.score);
-
-  const best = scored[0];
+  const ranking = rankCandidates(input);
+  const best = ranking.candidates[0];
 
   // Nothing matched. A bare "scroll" goal still has an answer; otherwise the
   // honest outcome is to stop rather than poke at a random element.
   if (!best) {
-    if (intent.scroll) {
+    if (ranking.intent.scroll) {
       return {
         action: { action: 'scroll', deltaY: Math.round(dom.viewport.height * 0.8), reason: 'scroll intent, no target element' },
         confidence: 0.7,
@@ -112,15 +90,80 @@ export function planLocally(input: PlanInput): AgentDecision {
     };
   }
 
-  const node = best.node;
-  const action = toAction(node, goal);
+  return {
+    action: toAction(best.node, goal),
+    confidence: scoreToConfidence(best.score, ranking.breadth),
+    source: 'heuristic',
+  };
+}
 
-  // Normalise: a strong match on a couple of goal words is as good as this
-  // planner ever gets, so cap well below "certain".
-  const ceiling = 0.78;
-  const confidence = Math.min(ceiling, 0.34 + best.score / (6 + wanted.length * 1.4));
+export interface Candidate {
+  node: ScrubbedNode;
+  score: number;
+}
 
-  return { action, confidence, source: 'heuristic' };
+export interface Intent {
+  fill: boolean;
+  click: boolean;
+  scroll: boolean;
+  navigate: boolean;
+}
+
+export interface Ranking {
+  /** Goal-relevant nodes, most relevant first. Empty when nothing matches. */
+  candidates: Candidate[];
+  /** How many expanded goal keywords were searched for; normalises scores. */
+  breadth: number;
+  intent: Intent;
+}
+
+/**
+ * Score every node against the goal.
+ *
+ * Used for two different jobs, which is the point: it picks which elements go
+ * into the VLM's prompt (so the model can actually see the one it needs), and
+ * it independently corroborates whatever the VLM then chooses. The VLM does
+ * the planning; this only decides what it gets to look at.
+ */
+export function rankCandidates(input: PlanInput): Ranking {
+  const { goal, dom, history = [] } = input;
+  const wanted = expand(tokenize(goal));
+
+  const intent: Intent = {
+    fill: INTENT.fill.test(goal),
+    click: INTENT.click.test(goal),
+    scroll: INTENT.scroll.test(goal),
+    navigate: INTENT.navigate.test(goal),
+  };
+
+  // A selector we already acted on twice is a loop; stop preferring it.
+  const acted = new Map<string, number>();
+  for (const h of history) {
+    const sel = 'selector' in h ? h.selector : undefined;
+    if (sel) acted.set(sel, (acted.get(sel) ?? 0) + 1);
+  }
+
+  const candidates = dom.nodes
+    .filter((n) => !n.disabled && n.visible)
+    .map((node) => ({ node, score: scoreNode(node, wanted, intent, acted) }))
+    .filter((c) => c.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  return { candidates, breadth: wanted.length, intent };
+}
+
+/**
+ * Where the ranker placed a selector, or undefined if it did not rank it at
+ * all. `0` means "this is what I would have picked too".
+ */
+export function rankOf(ranking: Ranking, selector: string): number | undefined {
+  const at = ranking.candidates.findIndex((c) => c.node.selector === selector);
+  return at === -1 ? undefined : at;
+}
+
+/** A strong keyword match is as good as this planner ever gets — cap it. */
+function scoreToConfidence(score: number, breadth: number): number {
+  return Math.min(0.78, 0.34 + score / (6 + breadth * 1.4));
 }
 
 function scoreNode(
