@@ -45,17 +45,53 @@ export interface WebGpuReport {
 /** Never throws — a missing adapter must degrade to escalation, not crash. */
 export async function probeWebGpu(): Promise<WebGpuReport> {
   const gpu = (navigator as Navigator & { gpu?: GPU }).gpu;
-  if (!gpu) return { available: false, reason: 'navigator.gpu undefined', fp16: false };
+
+  if (!gpu) {
+    return {
+      available: false,
+      reason: 'navigator.gpu undefined',
+      fp16: false,
+    };
+  }
+
   try {
-    const adapter = await gpu.requestAdapter();
-    if (!adapter) return { available: false, reason: 'no WebGPU adapter', fp16: false };
+    // First preference: high-performance adapter.
+    // On hybrid systems this tells the browser to prefer the discrete GPU.
+    let adapter = await gpu.requestAdapter({
+      powerPreference: 'high-performance',
+    });
+
+    // Fallback: if a high-performance adapter is unavailable,
+    // explicitly request a low-power adapter, which generally
+    // corresponds to the integrated GPU.
+    if (!adapter) {
+      adapter = await gpu.requestAdapter({
+        powerPreference: 'low-power',
+      });
+    }
+
+    // No WebGPU adapter at all.
+    if (!adapter) {
+      return {
+        available: false,
+        reason: 'no WebGPU adapter',
+        fp16: false,
+      };
+    }
+
+    const info = await adapterInfo(adapter);
+
     return {
       available: true,
-      adapter: describeAdapter(await adapterInfo(adapter)),
+      adapter: describeAdapter(info),
       fp16: adapter.features.has('shader-f16'),
     };
   } catch (err) {
-    return { available: false, reason: String(err), fp16: false };
+    return {
+      available: false,
+      reason: String(err),
+      fp16: false,
+    };
   }
 }
 
