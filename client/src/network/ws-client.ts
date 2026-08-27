@@ -17,6 +17,14 @@ import {
 
 export type WsState = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed';
 
+/**
+ * Give up after this many consecutive failures and go dormant. The socket only
+ * exists to serve `infer()`, so retrying forever on a timer just burns a socket
+ * every backoff interval — the reconnect ladder that reached "#11 in 36093ms"
+ * with the server simply not running. A later `infer()` re-arms it.
+ */
+const MAX_ATTEMPTS = 5;
+
 export interface WsClientOptions {
   url?: string;
   clientId?: string;
@@ -60,29 +68,57 @@ export class WsClient {
     return this.ack;
   }
 
+  /**
+   * Idempotent. Every guard here matters:
+   *
+   * The old condition was `this.ws && (state === 'open' || state === 'connecting')`,
+   * which let a call through whenever a reconnect was merely *pending* — and
+   * `background/index.ts` called `connect()` on every escalating step. Each call
+   * built a second WebSocket while the first was still live and its
+   * reconnect timer still armed. The abandoned socket kept its listeners, so its
+   * eventual `close` ran `handleClose` too and scheduled its own reconnect. That
+   * is the duplicated `reconnect #7` / `#8` inside the same second, with the
+   * attempt counter and the backoff both running away.
+   */
   connect(): void {
     this.stopped = false;
-    if (this.ws && (this.state === 'open' || this.state === 'connecting')) return;
+    if (this.reconnectTimer) return; // a retry is already queued
+    if (this.ws && (this.ws.readyState === WebSocket.CONNECTING || this.ws.readyState === WebSocket.OPEN)) return;
+    if (this.attempt >= MAX_ATTEMPTS) {
+      this.log(`dormant after ${this.attempt} failed attempts; a new request will retry`);
+      this.setState('closed');
+      return;
+    }
     this.setState(this.attempt === 0 ? 'connecting' : 'reconnecting');
+
+    let socket: WebSocket;
     try {
-      this.ws = new WebSocket(this.url);
+      socket = new WebSocket(this.url);
     } catch (err) {
       this.log('constructor threw', err);
       this.scheduleReconnect();
       return;
     }
-    this.ws.addEventListener('open', this.handleOpen);
-    this.ws.addEventListener('message', this.handleMessage);
-    this.ws.addEventListener('close', this.handleClose);
-    this.ws.addEventListener('error', () => this.log('socket error'));
+    this.ws = socket;
+    socket.addEventListener('open', () => this.handleOpen(socket));
+    socket.addEventListener('message', this.handleMessage);
+    socket.addEventListener('close', (ev) => this.handleClose(socket, ev));
+    // Only the current socket may speak for the client. Without this a
+    // superseded socket's close event resets `this.ws` to null underneath a
+    // healthy connection.
+    socket.addEventListener('error', () => {
+      if (socket === this.ws) this.log('socket error');
+    });
   }
 
   close(): void {
     this.stopped = true;
+    this.attempt = 0;
     this.clearTimers();
     this.rejectAll(new Error('client closed'));
-    this.ws?.close(1000, 'client shutdown');
+    const socket = this.ws;
     this.ws = null;
+    socket?.close(1000, 'client shutdown');
     this.setState('closed');
   }
 
@@ -93,7 +129,13 @@ export class WsClient {
     if (raw.length > DEFAULTS.maxPayloadBytes) {
       throw new Error(`payload ${raw.length}B exceeds cap ${DEFAULTS.maxPayloadBytes}B`);
     }
-    if (!this.connected || !this.ws) {
+    if (!this.connected) {
+      // Real demand, so forgive an exhausted attempt budget and try again now
+      // rather than waiting out a backoff nobody is watching.
+      if (this.attempt >= MAX_ATTEMPTS || this.reconnectTimer) {
+        this.clearTimers();
+        this.attempt = 0;
+      }
       this.connect();
       await this.waitForOpen(3_000);
     }

@@ -22,6 +22,39 @@ import { DEFAULT_MODEL_KEY, MODEL_REGISTRY, type Dtype, type DtypeMap, type Mode
 export { DEFAULT_MODEL_KEY, MODEL_REGISTRY, type ModelSpec };
 export { buildPrompt, parseAction, extractJson } from './decision-parser';
 
+/**
+ * Serve onnxruntime's WASM from the extension, not from a CDN.
+ *
+ * transformers.js sets `wasmPaths` to
+ * `https://cdn.jsdelivr.net/npm/@huggingface/transformers@<v>/dist/` for any
+ * context that is not a ServiceWorkerGlobalScope, and onnxruntime then
+ * dynamic-imports `ort-wasm-simd-threaded.jsep.mjs` from there. That is
+ * remotely hosted code: Manifest V3 forbids it, and `script-src` in
+ * `extension_pages` cannot whitelist a remote host. The import was blocked, so
+ * `from_pretrained` threw before reading a single weight — which is exactly why
+ * the popup reported `webgpu=true` and then "model init failed". WebGPU could
+ * not rescue it either, because onnxruntime's WebGPU execution provider lives
+ * *inside* that same jsep module.
+ *
+ * `/ort/` resolves against the worker's own origin, so this is correct both for
+ * a built extension (`chrome-extension://…/ort/`) and for the crxjs dev server.
+ * `npm run copy:ort` puts the files there; it runs as part of dev and build.
+ *
+ * chrome.* APIs are not exposed inside a dedicated worker, hence `import.meta`
+ * rather than `chrome.runtime.getURL`.
+ */
+const ORT_ASSET_PATH = new URL('/ort/', import.meta.url).href;
+
+function useLocalOrtAssets(): void {
+  const wasm = (env.backends?.onnx as { wasm?: Record<string, unknown> } | undefined)?.wasm;
+  if (!wasm) return;
+  wasm.wasmPaths = ORT_ASSET_PATH;
+  // Extension pages are not cross-origin isolated, so SharedArrayBuffer — and
+  // therefore threaded WASM — is unavailable. Ask for one thread rather than
+  // letting the runtime try to spawn workers it cannot create.
+  if (typeof SharedArrayBuffer === 'undefined') wasm.numThreads = 1;
+}
+
 export interface WebGpuReport {
   available: boolean;
   adapter?: string;
@@ -90,23 +123,47 @@ export async function loadModel(key: string, onProgress?: ProgressFn): Promise<L
   // model files are bundled with the extension.
   env.allowLocalModels = false;
   env.useBrowserCache = true;
+  useLocalOrtAssets();
 
   onProgress?.({ status: `loading ${spec.label} on ${device}` });
-  const processor = await AutoProcessor.from_pretrained(spec.id, { progress_callback: onProgress as never });
+  try {
+    const processor = await AutoProcessor.from_pretrained(spec.id, { progress_callback: onProgress as never });
 
-  // `AutoModelForImageTextToText`, not `AutoModelForVision2Seq`: Idefics3 and
-  // Qwen2-VL are three-graph (embed_tokens / vision_encoder /
-  // decoder_model_merged) image-text-to-text models. Vision2Seq looks for an
-  // `encoder_model` that these repos do not ship, and it is the only Auto class
-  // Qwen2-VL is not registered under at all.
-  const model = await AutoModelForImageTextToText.from_pretrained(spec.id, {
-    dtype,
-    device,
-    progress_callback: onProgress as never,
-  });
+    // `AutoModelForImageTextToText`, not `AutoModelForVision2Seq`: Idefics3 and
+    // Qwen2-VL are three-graph (embed_tokens / vision_encoder /
+    // decoder_model_merged) image-text-to-text models. Vision2Seq looks for an
+    // `encoder_model` that these repos do not ship, and it is the only Auto class
+    // Qwen2-VL is not registered under at all.
+    const model = await AutoModelForImageTextToText.from_pretrained(spec.id, {
+      dtype,
+      device,
+      progress_callback: onProgress as never,
+    });
 
-  onProgress?.({ status: `ready on ${device}`, progress: 100 });
-  return { spec, device, dtype, processor, model };
+    onProgress?.({ status: `ready on ${device}`, progress: 100 });
+    return { spec, device, dtype, processor, model };
+  } catch (err) {
+    throw new Error(describeLoadFailure(err, device));
+  }
+}
+
+/**
+ * Turn onnxruntime's opaque load errors into something actionable. The three
+ * failures below are the ones that actually happen in an MV3 extension, and all
+ * three otherwise surface as an unexplained "model init failed".
+ */
+function describeLoadFailure(err: unknown, device: string): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/ort-wasm|wasmPaths|Failed to fetch dynamically imported module|import.*\.mjs/i.test(msg)) {
+    return `${msg} — onnxruntime's WASM was not found at ${ORT_ASSET_PATH}. Run \`npm run copy:ort\` and reload the extension.`;
+  }
+  if (/Content Security Policy|Refused to (load|connect)/i.test(msg)) {
+    return `${msg} — blocked by the extension CSP. Check content_security_policy in manifest.json.`;
+  }
+  if (device === 'webgpu' && /shader|createShaderModule|device.*lost|GPU/i.test(msg)) {
+    return `${msg} — WebGPU rejected the model's shaders. Try a smaller model, or disable WebGPU to fall back to CPU/WASM.`;
+  }
+  return msg;
 }
 
 export interface GenerateArgs {

@@ -5,8 +5,9 @@
   "type": "module",
   "description": "Manifest V3 extension: local WebGPU VLM agent with privacy-redacted cloud escalation",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
+    "copy:ort": "node scripts/copy-ort.mjs",
+    "dev": "npm run copy:ort && vite",
+    "build": "npm run copy:ort && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
