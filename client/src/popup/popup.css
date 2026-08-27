@@ -143,3 +143,4 @@ label small { color: var(--faint); font-size: 10px; }
 .log div.error { color: var(--err); }
 .log .t { color: var(--faint); margin-right: 6px; }
 .log .s { color: var(--accent); margin-right: 6px; }
+.log .d { display: block; padding-left: 6px; color: var(--faint); }

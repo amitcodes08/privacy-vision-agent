@@ -165,7 +165,8 @@ export class WsClient {
     });
   }
 
-  private handleOpen = (): void => {
+  private handleOpen = (socket: WebSocket): void => {
+    if (socket !== this.ws) return socket.close(1000, 'superseded');
     this.attempt = 0;
     this.setState('open');
     this.send(
@@ -223,7 +224,11 @@ export class WsClient {
     }
   };
 
-  private handleClose = (ev: CloseEvent): void => {
+  private handleClose = (socket: WebSocket, ev: CloseEvent): void => {
+    // A socket we already replaced must not touch shared state — otherwise its
+    // close nulls `this.ws`, rejects the live connection's pending requests, and
+    // queues a reconnect that races the real one.
+    if (socket !== this.ws) return;
     this.clearTimers();
     this.rejectAll(new Error(`socket closed (${ev.code})`));
     this.ws = null;
@@ -232,11 +237,21 @@ export class WsClient {
   };
 
   private scheduleReconnect(): void {
-    this.setState('reconnecting');
-    const backoff = Math.min(30_000, 500 * 2 ** this.attempt) * (0.75 + Math.random() * 0.5);
     this.attempt++;
+    if (this.attempt >= MAX_ATTEMPTS) {
+      this.log(`giving up after ${this.attempt} attempts; dormant until the next request`);
+      this.setState('closed');
+      return;
+    }
+    this.setState('reconnecting');
+    // 8s ceiling rather than 30s: this is localhost, and the attempt cap keeps
+    // the whole ladder short enough that a user watching the log can follow it.
+    const backoff = Math.min(8_000, 500 * 2 ** (this.attempt - 1)) * (0.75 + Math.random() * 0.5);
     this.log(`reconnect #${this.attempt} in ${Math.round(backoff)}ms`);
-    this.reconnectTimer = setTimeout(() => this.connect(), backoff);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, backoff);
   }
 
   private startHeartbeat(intervalMs: number): void {

@@ -104,3 +104,59 @@ describe('buildScrubbedDom', () => {
     expect(dom.url).not.toContain('?');
   });
 });
+
+/**
+ * The node budget used to be spent in raw document order, so on a real
+ * application the nav chrome ate it and the element the user asked about never
+ * reached the model at all. jsdom reports all-zero rects, so these assert the
+ * operability and accessible-name parts of the priority; the viewport term is
+ * not observable here.
+ */
+describe('buildScrubbedDom node budget', () => {
+  const CHROME_THEN_FILES = `
+    <nav>
+      <div role="presentation"></div>
+      <div role="presentation"></div>
+      <div role="none"></div>
+      <div role="separator"></div>
+      <div role="presentation"></div>
+    </nav>
+    <ul id="files">
+      <li><a id="pkg" href="/repo/blob/main/package.json">package.json</a></li>
+      <li><a id="readme" href="/repo/blob/main/README.md">README.md</a></li>
+    </ul>
+  `;
+
+  beforeEach(() => {
+    document.body.innerHTML = CHROME_THEN_FILES;
+  });
+
+  it('spends the budget on operable named elements, not on earlier bare roles', () => {
+    const { dom } = buildScrubbedDom(document, 3);
+    const selectors = dom.nodes.map((n) => n.selector);
+    expect(selectors).toContain('#pkg');
+    expect(selectors).toContain('#readme');
+    expect(dom.nodes).toHaveLength(3);
+  });
+
+  it('emits the selected nodes in document order with monotonic ids', () => {
+    const { dom } = buildScrubbedDom(document, 3);
+    expect(dom.nodes.map((n) => n.id)).toEqual([0, 1, 2]);
+    const at = (sel: string) => dom.nodes.findIndex((n) => n.selector === sel);
+    expect(at('#pkg')).toBeLessThan(at('#readme'));
+  });
+
+  it('prefers the element with an accessible name when the budget is one', () => {
+    document.body.innerHTML = `
+      <div role="button" id="mystery"></div>
+      <div role="button" id="named">Download</div>
+    `;
+    const { dom } = buildScrubbedDom(document, 1);
+    expect(dom.nodes.map((n) => n.selector)).toEqual(['#named']);
+  });
+
+  it('indexes every emitted node back to a live element', () => {
+    const { dom, index } = buildScrubbedDom(document, 3);
+    for (const n of dom.nodes) expect(index.get(n.selector)).toBe(document.querySelector(n.selector));
+  });
+});

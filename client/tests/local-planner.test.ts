@@ -30,6 +30,12 @@ const LOGIN = dom([
   node({ id: 3, selector: '#search', tag: 'input', type: 'search', placeholder: 'Search products' }),
 ]);
 
+const FILES = dom([
+  node({ id: 0, selector: '#help', text: 'Click here for help' }),
+  node({ id: 1, selector: '#pkg', tag: 'a', text: 'package.json', href: 'https://shop.test/repo/blob/main/package.json' }),
+  node({ id: 2, selector: '#readme', tag: 'a', text: 'README.md', href: 'https://shop.test/repo/blob/main/README.md' }),
+]);
+
 describe('planLocally', () => {
   it('maps "accept cookies" onto an Accept button via synonyms', () => {
     const d = planLocally({ goal: 'accept cookies', dom: CONSENT });
@@ -97,6 +103,11 @@ describe('planLocally', () => {
     const d = planLocally({ goal: 'log in to my account', dom: blog });
     expect(d.action.action).toBe('done');
   });
+
+  it('targets the named file for "click on package.json"', () => {
+    const d = planLocally({ goal: 'click on package.json', dom: FILES });
+    expect(d.action).toMatchObject({ action: 'click', selector: '#pkg' });
+  });
 });
 
 describe('rankCandidates', () => {
@@ -137,5 +148,13 @@ describe('rankCandidates', () => {
       rankCandidates({ goal, dom: CONSENT, history: [{ action: 'click', selector: '#accept' }] })
         .candidates.find((c) => c.node.selector === '#accept')?.score ?? 0;
     expect(stale).toBeLessThan(fresh);
+  });
+
+  it('reads an operation verb as intent only, never as a content keyword', () => {
+    const ranking = rankCandidates({ goal: 'click on package.json', dom: FILES });
+    expect(ranking.intent.click).toBe(true);
+    // "Click here for help" overlaps the goal on the verb alone.
+    expect(rankOf(ranking, '#help')).toBeUndefined();
+    expect(rankOf(ranking, '#pkg')).toBe(0);
   });
 });

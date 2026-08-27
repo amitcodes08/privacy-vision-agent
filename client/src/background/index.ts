@@ -33,6 +33,16 @@ let modelReady = false;
 let webgpuAvailable = false;
 let localModelId: string | undefined;
 
+/**
+ * Escalation circuit breaker. With the server down, every step paid a redaction
+ * pass plus `waitForOpen`'s 3s timeout and then fell back on-device anyway —
+ * while the socket's own retry ladder ran in parallel. Two failures is enough
+ * evidence for one run.
+ */
+const MAX_ESCALATION_FAILURES = 2;
+let escalationFailures = 0;
+let escalationDown = false;
+
 const status: AgentStatus = {
   running: false,
   step: 0,
@@ -85,23 +95,56 @@ function ensureOffscreen(): Promise<void> {
 
 type OffscreenReply<T> = ({ ok: true } & T) | { ok: false; error: string };
 
+/**
+ * `createDocument` resolves once the *document* exists, which is not the same as
+ * its message listener being registered — the module script still has to load
+ * and run. So the first send after creation could lose the race and come back
+ * "Could not establish connection. Receiving end does not exist.", which the
+ * warm-up then reported as a model failure. The window is widest in dev, where
+ * the offscreen page pulls its script over HTTP from the crxjs dev server.
+ *
+ * Retried only for that error: everything else is a real reply from a listener
+ * that did receive the message.
+ */
+const OFFSCREEN_HANDSHAKE_ATTEMPTS = 8;
+const OFFSCREEN_HANDSHAKE_DELAY_MS = 250;
+
+const isListenerMissing = (msg: string): boolean =>
+  /Receiving end does not exist|Could not establish connection|message port closed/i.test(msg);
+
 async function askOffscreen<T>(msg: Record<string, unknown>): Promise<OffscreenReply<T>> {
-  try {
-    await ensureOffscreen();
-    return (await chrome.runtime.sendMessage({ target: 'offscreen', ...msg })) as OffscreenReply<T>;
-  } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  let last = 'offscreen document never answered';
+  for (let attempt = 1; attempt <= OFFSCREEN_HANDSHAKE_ATTEMPTS; attempt++) {
+    try {
+      await ensureOffscreen();
+      return (await chrome.runtime.sendMessage({ target: 'offscreen', ...msg })) as OffscreenReply<T>;
+    } catch (err) {
+      last = err instanceof Error ? err.message : String(err);
+      if (!isListenerMissing(last)) return { ok: false, error: last };
+      // The document may have been torn down between attempts; re-probe it.
+      offscreenReady = null;
+      await sleep(OFFSCREEN_HANDSHAKE_DELAY_MS);
+    }
   }
+  return { ok: false, error: `${last} (offscreen listener not ready after ${OFFSCREEN_HANDSHAKE_ATTEMPTS} attempts)` };
 }
 
 /**
- * Download weights and create the GPU sessions. Safe to call repeatedly:
- * concurrent callers share one attempt, and a previous failure does not
- * permanently disable the local path.
+ * Download weights and create the GPU sessions. Concurrent callers share one
+ * attempt.
+ *
+ * A hard failure is remembered. Without that, `runAgent` re-entered the load on
+ * every run and re-ran a download that had already failed for a structural
+ * reason, logging the same multi-line error each time. `force` — the popup's
+ * WARM_UP — clears it, because an explicit retry is a user asking for exactly
+ * that.
  */
 let warmUp: Promise<boolean> | null = null;
+let warmUpFailed = false;
 
-function warmUpLocalModel(settings: Settings): Promise<boolean> {
+function warmUpLocalModel(settings: Settings, opts: { force?: boolean } = {}): Promise<boolean> {
+  if (warmUpFailed && !opts.force) return Promise.resolve(false);
+  if (opts.force) warmUpFailed = false;
   warmUp ??= (async () => {
     status.modelLoading = true;
     status.modelStage = 'probing WebGPU';
@@ -123,13 +166,18 @@ function warmUpLocalModel(settings: Settings): Promise<boolean> {
         status.localModelId = init.modelId;
         status.modelStage = `ready on ${init.device}`;
         status.modelProgress = 100;
+        status.modelError = undefined;
         logger.info('local', `model ready on ${init.device}`, init.modelId);
         return true;
       }
       modelReady = false;
+      warmUpFailed = true;
       status.localModelReady = false;
       status.modelStage = 'load failed';
-      logger.warn('local', 'model init failed; using the on-device planner instead', init.error);
+      // Put the cause in the message, not the data payload: the popup renders
+      // messages, so "model init failed" alone was unactionable.
+      status.modelError = init.error;
+      logger.warn('local', `model init failed (${init.error}); using the on-device planner instead`);
       return false;
     } finally {
       status.modelLoading = false;
@@ -228,6 +276,55 @@ async function execute(tabId: number, action: AgentAction): Promise<{ ok: boolea
 }
 
 /* ---------------------------------------------------------------- *
+ * Frame capture
+ * ---------------------------------------------------------------- */
+
+/**
+ * Chrome caps `captureVisibleTab` at MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND
+ * (2/s) and rejects the call over quota. A step can complete in well under
+ * 500ms when the deterministic planner answers, so the loop tripped the quota
+ * and — because the rejection propagated out of `step()` — aborted the entire
+ * run. Two rules fix it: never capture faster than the quota allows, and never
+ * let a capture failure end the run.
+ */
+const CAPTURE_MIN_INTERVAL_MS = 600;
+let lastCaptureAt = 0;
+let captureChain: Promise<unknown> = Promise.resolve();
+
+async function captureFrame(): Promise<string> {
+  // Serialise: two concurrent captures would both read a stale `lastCaptureAt`.
+  const run = captureChain.then(async () => {
+    const wait = CAPTURE_MIN_INTERVAL_MS - (Date.now() - lastCaptureAt);
+    if (wait > 0) await sleep(wait);
+    try {
+      return await chrome.tabs.captureVisibleTab({ format: 'jpeg', quality: 90 });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!/MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND/i.test(msg)) throw err;
+      // Quota is a per-second window, so one wait is always enough.
+      await sleep(CAPTURE_MIN_INTERVAL_MS);
+      return await chrome.tabs.captureVisibleTab({ format: 'jpeg', quality: 90 });
+    } finally {
+      lastCaptureAt = Date.now();
+    }
+  });
+  captureChain = run.catch(() => undefined);
+  return run;
+}
+
+/**
+ * Capture at most once per step, and only if something actually wants pixels.
+ *
+ * The deterministic planner reads the scrubbed DOM and never looks at the
+ * screenshot, so on a run with no local model every one of those captures was
+ * both wasted and the reason the quota blew.
+ */
+function frameOnce(): () => Promise<string> {
+  let cached: Promise<string> | null = null;
+  return () => (cached ??= captureFrame());
+}
+
+/* ---------------------------------------------------------------- *
  * The loop
  * ---------------------------------------------------------------- */
 
@@ -243,13 +340,14 @@ async function execute(tabId: number, action: AgentAction): Promise<{ ok: boolea
 async function step(tabId: number, goal: string, history: AgentAction[], settings: Settings): Promise<AgentAction> {
   const { dom, boxes, dpr } = await scrape(tabId);
   status.redactions += boxes.length;
-  const rawFrame = await chrome.tabs.captureVisibleTab({ format: 'jpeg', quality: 90 });
+  const frame = frameOnce();
 
   // --- Path 1: local VLM, unredacted, zero network ----------------
   let decision: AgentDecision | null = null;
   if (modelReady) {
     // Downscale once here so the multi-MB HiDPI capture never crosses the
     // runtime message channel or the image processor at full size.
+    const rawFrame = await frame();
     const small = await downscaleFrame(rawFrame, DEFAULTS.maxFrameWidth).catch(() => ({ dataUrl: rawFrame }));
     const local = await askOffscreen<{ decision: AgentDecision; raw: string }>({
       kind: 'INFER',
@@ -266,7 +364,7 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
         local.raw.slice(0, 200),
       );
     } else {
-      logger.warn('local', 'inference error', local.error);
+      logger.warn('local', `inference error: ${local.error}`);
     }
   }
 
@@ -296,22 +394,26 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
   }
 
   const best = decision ?? planned;
+  const onDevice = () => pickActionable(decision, planned) ?? pickActionable(planLocally({ goal, dom, history }), null);
 
   // --- Path 3: redact, then escalate -----------------------------
-  if (!settings.allowEscalation) {
-    // Escalation is off, so act on the best on-device guess rather than
-    // stalling — but only if it names a real element.
-    const fallback = pickActionable(decision, planned);
+  // `escalationsOff` covers both the setting and the circuit breaker: once the
+  // server has failed twice in a run it is not coming back, and every further
+  // attempt costs a redaction pass plus a 3s connect timeout per step for
+  // nothing.
+  if (!settings.allowEscalation || escalationDown) {
+    const fallback = onDevice();
     if (fallback) {
-      if (fallback === planned) status.heuristicDecisions++;
+      if (fallback.source === 'heuristic') status.heuristicDecisions++;
       else status.localDecisions++;
-      logger.info('escalate', 'disabled; acting on the best on-device decision');
+      logger.info('escalate', `${escalationDown ? 'server unreachable' : 'disabled'}; acting on the best on-device decision`);
       return applyDecision(tabId, fallback);
     }
-    logger.warn('escalate', 'blocked by settings; stopping');
-    return { action: 'done', summary: 'low confidence and escalation disabled' };
+    logger.warn('escalate', 'unavailable and nothing actionable on-device; stopping');
+    return { action: 'done', summary: 'low confidence and no escalation available' };
   }
 
+  const rawFrame = await frame();
   const bitmap = await dataUrlToBitmap(rawFrame);
   const redacted = await redactFrame(bitmap, {
     boxes,
@@ -327,8 +429,10 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
   );
 
   ws ??= makeWsClient(settings);
-  ws.connect();
   try {
+    // No explicit connect(): `infer` connects on demand. Calling it here on
+    // every step is what spawned a second socket mid-backoff and turned one
+    // failed connection into a reconnect storm.
     const response = await ws.infer({
       goal,
       imageBase64: redacted.base64,
@@ -338,13 +442,20 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
       localConfidence: best?.confidence ?? 0,
       localReason: (best && reasonOf(best)) ?? 'below threshold',
     });
+    escalationFailures = 0;
     status.escalations++;
     logger.info('escalate', `cloud decision ${response.decision.action.action}`, response.rationale);
     return applyDecision(tabId, response.decision);
   } catch (err) {
     // The server is a convenience, not a dependency. Fall back on-device.
+    escalationFailures++;
+    if (escalationFailures >= MAX_ESCALATION_FAILURES) {
+      escalationDown = true;
+      ws.close();
+      logger.warn('escalate', `${escalationFailures} failures; staying on-device for the rest of this run`);
+    }
     logger.warn('escalate', `failed: ${err instanceof Error ? err.message : String(err)}; falling back on-device`);
-    const fallback = pickActionable(decision, planned) ?? pickActionable(planLocally({ goal, dom, history }), null);
+    const fallback = onDevice();
     if (fallback) {
       if (fallback.source === 'heuristic') status.heuristicDecisions++;
       else status.localDecisions++;
@@ -402,6 +513,8 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
   const settings = await loadSettings();
   running = true;
   stopRequested = false;
+  escalationFailures = 0;
+  escalationDown = false;
   status.running = true;
   status.goal = goal;
   status.step = 0;
@@ -438,6 +551,9 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
   } finally {
     running = false;
     status.running = false;
+    // Nothing wants the socket between runs, and leaving it open meant its
+    // reconnect ladder kept firing long after the agent had stopped.
+    ws?.close();
   }
 }
 
@@ -496,7 +612,7 @@ chrome.runtime.onMessage.addListener((msg: Record<string, unknown>, _sender, sen
           // Respond immediately; a multi-hundred-MB download must not sit on an
           // open message port. The popup polls `status` for progress.
           sendResponse({ ok: true, status });
-          void warmUpLocalModel(settings);
+          void warmUpLocalModel(settings, { force: true });
           return;
         }
         default:

@@ -24,6 +24,12 @@ const STOPWORDS = new Set([
   'its', 'his', 'her', 'their', 'has', 'have', 'was', 'were', 'are', 'but',
   'not', 'all', 'any', 'out', 'off', 'now', 'page', 'site', 'website', 'button',
   'link', 'field', 'box', 'first', 'next', 'also', 'again',
+  // Pure operation verbs. These are already read as *intent* below, and as
+  // content keywords they are noise: "click on package.json" scored every
+  // element for the word "click". Words that double as real labels — accept,
+  // login, search, submit, close — deliberately stay out of this list.
+  'click', 'clicks', 'clicking', 'press', 'tap', 'hit', 'push', 'type', 'paste',
+  'navigate', 'visit', 'browse', 'goto',
 ]);
 
 /** Verbs that tell us which *kind* of element to prefer. */

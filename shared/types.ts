@@ -354,6 +354,8 @@ export interface AgentStatus {
   modelProgress?: number;
   /** Human-readable load stage, e.g. "loading SmolVLM 256M on webgpu". */
   modelStage?: string;
+  /** Why the local model failed to load, if it did. Survives past the log ring. */
+  modelError?: string;
   lastDecision?: AgentDecision;
   lastError?: string;
   escalations: number;

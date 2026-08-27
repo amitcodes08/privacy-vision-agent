@@ -18,41 +18,21 @@ import type { AgentAction, AgentDecision, ScrubbedDom } from '@shared/types';
 import { buildPrompt, parseAction } from './decision-parser';
 import { rankCandidates } from './local-planner';
 import { DEFAULT_MODEL_KEY, MODEL_REGISTRY, type Dtype, type DtypeMap, type ModelSpec } from './models';
+import { ORT_WASM_URL, ortWasmConfig } from './ort-assets';
 
 export { DEFAULT_MODEL_KEY, MODEL_REGISTRY, type ModelSpec };
 export { buildPrompt, parseAction, extractJson } from './decision-parser';
 
 /**
- * Serve onnxruntime's WASM from the extension, not from a CDN.
- *
- * transformers.js sets `wasmPaths` to
- * `https://cdn.jsdelivr.net/npm/@huggingface/transformers@<v>/dist/` for any
- * context that is not a ServiceWorkerGlobalScope, and onnxruntime then
- * dynamic-imports `ort-wasm-simd-threaded.jsep.mjs` from there. That is
- * remotely hosted code: Manifest V3 forbids it, and `script-src` in
- * `extension_pages` cannot whitelist a remote host. The import was blocked, so
- * `from_pretrained` threw before reading a single weight — which is exactly why
- * the popup reported `webgpu=true` and then "model init failed". WebGPU could
- * not rescue it either, because onnxruntime's WebGPU execution provider lives
- * *inside* that same jsep module.
- *
- * `/ort/` resolves against the worker's own origin, so this is correct both for
- * a built extension (`chrome-extension://…/ort/`) and for the crxjs dev server.
- * `npm run copy:ort` puts the files there; it runs as part of dev and build.
- *
- * chrome.* APIs are not exposed inside a dedicated worker, hence `import.meta`
- * rather than `chrome.runtime.getURL`.
+ * Serve onnxruntime's WASM binary from the extension, and keep onnxruntime on
+ * its *embedded* emscripten glue rather than importing any glue at all. Both
+ * halves of that matter, and the reasoning lives in `ort-assets.ts` — it is
+ * longer than the code.
  */
-const ORT_ASSET_PATH = new URL('/ort/', import.meta.url).href;
-
 function useLocalOrtAssets(): void {
   const wasm = (env.backends?.onnx as { wasm?: Record<string, unknown> } | undefined)?.wasm;
   if (!wasm) return;
-  wasm.wasmPaths = ORT_ASSET_PATH;
-  // Extension pages are not cross-origin isolated, so SharedArrayBuffer — and
-  // therefore threaded WASM — is unavailable. Ask for one thread rather than
-  // letting the runtime try to spawn workers it cannot create.
-  if (typeof SharedArrayBuffer === 'undefined') wasm.numThreads = 1;
+  Object.assign(wasm, ortWasmConfig());
 }
 
 export interface WebGpuReport {
@@ -69,17 +49,38 @@ export async function probeWebGpu(): Promise<WebGpuReport> {
   try {
     const adapter = await gpu.requestAdapter();
     if (!adapter) return { available: false, reason: 'no WebGPU adapter', fp16: false };
-    const info = await (adapter as GPUAdapter & { requestAdapterInfo?: () => Promise<GPUAdapterInfo> })
-      .requestAdapterInfo?.()
-      .catch(() => undefined);
     return {
       available: true,
-      adapter: info ? `${info.vendor ?? '?'} ${info.architecture ?? ''}`.trim() : 'unknown',
+      adapter: describeAdapter(await adapterInfo(adapter)),
       fp16: adapter.features.has('shader-f16'),
     };
   } catch (err) {
     return { available: false, reason: String(err), fp16: false };
   }
+}
+
+/**
+ * `requestAdapterInfo()` was removed in Chrome 130 in favour of the synchronous
+ * `adapter.info`. Reading only the old one is why the log said `webgpu=true
+ * unknown` on a machine whose GPU was working fine.
+ */
+type AdapterInfoish = Partial<Record<'vendor' | 'architecture' | 'device' | 'description', string>>;
+
+async function adapterInfo(adapter: GPUAdapter): Promise<AdapterInfoish | undefined> {
+  const a = adapter as GPUAdapter & {
+    info?: AdapterInfoish;
+    requestAdapterInfo?: () => Promise<AdapterInfoish>;
+  };
+  if (a.info) return a.info;
+  return a.requestAdapterInfo?.().catch(() => undefined);
+}
+
+function describeAdapter(info: AdapterInfoish | undefined): string {
+  if (!info) return 'adapter details unavailable';
+  // Chrome reports these piecemeal and blanks some of them for fingerprinting
+  // reasons, so take whatever is actually populated.
+  const label = [info.vendor, info.architecture, info.device].filter(Boolean).join(' ').trim();
+  return label || info.description?.trim() || 'adapter details unavailable';
 }
 
 export interface LoadedModel {
@@ -148,19 +149,27 @@ export async function loadModel(key: string, onProgress?: ProgressFn): Promise<L
 }
 
 /**
- * Turn onnxruntime's opaque load errors into something actionable. The three
- * failures below are the ones that actually happen in an MV3 extension, and all
- * three otherwise surface as an unexplained "model init failed".
+ * Turn onnxruntime's opaque load errors into something actionable. The failures
+ * below are the ones that actually happen in an MV3 extension, and all of them
+ * otherwise surface as an unexplained "model init failed".
  */
 function describeLoadFailure(err: unknown, device: string): string {
   const msg = err instanceof Error ? err.message : String(err);
+  // Ordered before the WebGPU case deliberately. onnxruntime reports *every*
+  // backend failure as `no available backend found. ERR: [webgpu] …`, including
+  // ones that happened while instantiating the wasm module — i.e. before WebGPU
+  // was reached at all. Matched second, the shader hint below claims these on
+  // the word "webgpu" alone and points the reader at the wrong layer.
+  if (/no available backend|both async and sync fetching|initializeWebAssembly/i.test(msg)) {
+    return `${msg} — onnxruntime never instantiated its wasm module, so no execution provider could start. It expects ${ORT_WASM_URL}: run \`npm run copy:ort\` and reload the extension.`;
+  }
   if (/ort-wasm|wasmPaths|Failed to fetch dynamically imported module|import.*\.mjs/i.test(msg)) {
-    return `${msg} — onnxruntime's WASM was not found at ${ORT_ASSET_PATH}. Run \`npm run copy:ort\` and reload the extension.`;
+    return `${msg} — onnxruntime's WASM was not found at ${ORT_WASM_URL}. Run \`npm run copy:ort\` and reload the extension.`;
   }
   if (/Content Security Policy|Refused to (load|connect)/i.test(msg)) {
     return `${msg} — blocked by the extension CSP. Check content_security_policy in manifest.json.`;
   }
-  if (device === 'webgpu' && /shader|createShaderModule|device.*lost|GPU/i.test(msg)) {
+  if (device === 'webgpu' && /shader|createShaderModule|device.*lost/i.test(msg)) {
     return `${msg} — WebGPU rejected the model's shaders. Try a smaller model, or disable WebGPU to fall back to CPU/WASM.`;
   }
   return msg;

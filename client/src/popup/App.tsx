@@ -12,6 +12,12 @@ interface StatusReply {
 
 const send = <T,>(msg: Record<string, unknown>) => chrome.runtime.sendMessage(msg) as Promise<T>;
 
+/** One short line for a log entry's `data`, whatever shape it arrived in. */
+const detail = (d: unknown): string => {
+  const s = typeof d === 'string' ? d : JSON.stringify(d);
+  return s.length > 160 ? `${s.slice(0, 160)}…` : s;
+};
+
 export default function App() {
   const [goal, setGoal] = useState('');
   const [status, setStatus] = useState<AgentStatus | null>(null);
@@ -74,7 +80,7 @@ export default function App() {
     return { label: 'on-device planner', tone: 'warn' as const };
   }, [status]);
 
-  const problem = errorMsg ?? status?.lastError;
+  const problem = errorMsg ?? status?.lastError ?? status?.modelError;
   const acted = (status?.localDecisions ?? 0) + (status?.heuristicDecisions ?? 0);
   const escalated = status?.escalations ?? 0;
   const hasRun = acted + escalated > 0;
@@ -231,6 +237,10 @@ export default function App() {
                 <span className="t">{new Date(l.ts).toLocaleTimeString()}</span>
                 <span className="s">{l.scope}</span>
                 {l.message}
+                {/* The cause of a failure often lived only in `data`, which was
+                    never rendered — so a load error read as an unexplained
+                    "model init failed". */}
+                {l.data !== undefined && l.data !== '' && <span className="d">{detail(l.data)}</span>}
               </div>
             ))}
         </div>

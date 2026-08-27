@@ -163,6 +163,57 @@ export interface ScrubResult {
   index: Map<string, Element>;
 }
 
+/**
+ * How many candidates we are willing to *examine* before selecting. The node
+ * budget caps what we emit; this caps the cost of ranking on a huge page.
+ */
+const MAX_CANDIDATES = 1_500;
+
+const OPERABLE = new Set(['a', 'button', 'input', 'select', 'textarea', 'summary']);
+const OPERABLE_ROLES = new Set(['button', 'link', 'menuitem', 'tab', 'checkbox', 'radio', 'option', 'switch', 'combobox', 'textbox', 'searchbox']);
+
+/**
+ * Priority for the node budget.
+ *
+ * The budget used to be spent in raw document order, and `INTERACTIVE` matches
+ * `[role]` — which on a real application is nearly everything. So the first 120
+ * matches were the skip links, the logo, the global nav and the tab strip, and
+ * the element the user was actually asking about never entered `dom.nodes` at
+ * all. Neither planner can choose what it cannot see, so the VLM picked the
+ * closest listed thing and the ranker keyword-matched some header link: "click
+ * package.json" clicking something else entirely.
+ *
+ * Being *in the viewport* dominates, because the screenshot only shows the
+ * viewport — an element list that disagrees with the picture is worse than a
+ * short one. After that, prefer things a user can operate and things with an
+ * accessible name.
+ */
+function priority(el: Element, view: Window | null, named: boolean): number {
+  let score = 0;
+
+  const r = el.getBoundingClientRect?.();
+  const vh = view?.innerHeight ?? 0;
+  const vw = view?.innerWidth ?? 0;
+  if (r && r.width > 0 && r.height > 0) {
+    const onScreen = r.bottom > 0 && r.top < vh && r.right > 0 && r.left < vw;
+    if (onScreen) score += 100;
+    // Just below the fold is still likely relevant; far away is not.
+    else if (r.top >= vh && r.top < vh * 2) score += 30;
+    if (r.width * r.height < 24) score -= 10; // tracking pixels, icon slivers
+  }
+
+  const tag = el.tagName.toLowerCase();
+  const role = el.getAttribute('role');
+  if (OPERABLE.has(tag)) score += 40;
+  else if (role && OPERABLE_ROLES.has(role)) score += 30;
+  else if (tag === 'label' || el.getAttribute('contenteditable') === 'true') score += 20;
+  else if (/^h[1-3]$/.test(tag) || tag === 'legend') score += 15; // page structure
+  else score += 2; // a bare [role] we do not recognise
+
+  if (named) score += 25;
+  return score;
+}
+
 export function buildScrubbedDom(
   doc: Document = document,
   maxNodes: number = DEFAULTS.maxDomNodes,
@@ -176,12 +227,30 @@ export function buildScrubbedDom(
     summary[r] = (summary[r] ?? 0) + 1;
   };
 
-  let id = 0;
-  const candidates = [...doc.querySelectorAll(INTERACTIVE), ...doc.querySelectorAll('h1,h2,h3,legend')];
-  for (const el of candidates) {
-    if (nodes.length >= maxNodes) break;
+  // Two passes. First rank every visible candidate and keep the best
+  // `maxNodes`; only then emit, in document order, so ids stay monotonic and
+  // line up with how a reader scans the screenshot.
+  const all = [...doc.querySelectorAll(INTERACTIVE), ...doc.querySelectorAll('h1,h2,h3,legend')].slice(
+    0,
+    MAX_CANDIDATES,
+  );
+  const ranked: { el: Element; order: number; score: number }[] = [];
+  for (let order = 0; order < all.length; order++) {
+    const el = all[order]!;
     if (!isVisible(el)) continue;
+    const named = [
+      el.getAttribute('aria-label'),
+      el.getAttribute('placeholder'),
+      el.getAttribute('name'),
+      squash(directText(el)),
+    ].some((s) => Boolean(s?.trim()));
+    ranked.push({ el, order, score: priority(el, view, named) });
+  }
+  ranked.sort((a, b) => b.score - a.score || a.order - b.order);
+  const selected = ranked.slice(0, maxNodes).sort((a, b) => a.order - b.order);
 
+  let id = 0;
+  for (const { el } of selected) {
     const reasons = classifyElement(el);
     const selector = cssPath(el, doc);
     index.set(selector, el);
