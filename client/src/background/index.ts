@@ -566,8 +566,8 @@ async function applyDecision(
       (origNode.name === targetNode.name || origNode.label === targetNode.label || origNode.text === targetNode.text);
 
     if (!isSameElement && origNode) {
-      // Attempt to re-locate the intended element in the new DOM by matching key semantic attributes
-      const relocated = immediatePreDom.nodes.find(
+      // Find all candidates in the updated DOM matching the original node's key semantic attributes
+      const candidates = immediatePreDom.nodes.filter(
         (n) =>
           n.tag === origNode.tag &&
           ((origNode.label && n.label === origNode.label) ||
@@ -576,13 +576,22 @@ async function applyDecision(
            (origNode.text && n.text === origNode.text)),
       );
 
-      if (relocated) {
-        logger.info('execute', `reconciled stale selector ${action.selector} -> ${relocated.selector}`);
-        action = { ...action, selector: relocated.selector };
+      if (candidates.length === 1) {
+        logger.info('execute', `reconciled stale selector ${action.selector} -> ${candidates[0].selector}`);
+        action = { ...action, selector: candidates[0].selector };
+      } else if (candidates.length > 1 && origNode.box) {
+        // Disambiguate by spatial proximity if bounding box is known
+        const closest = candidates.slice().sort((a, b) => {
+          const distA = Math.hypot((a.box?.x ?? 0) - origNode.box!.x, (a.box?.y ?? 0) - origNode.box!.y);
+          const distB = Math.hypot((b.box?.x ?? 0) - origNode.box!.x, (b.box?.y ?? 0) - origNode.box!.y);
+          return distA - distB;
+        })[0];
+        logger.info('execute', `disambiguated stale selector ${action.selector} -> ${closest.selector}`);
+        action = { ...action, selector: closest.selector };
       } else {
-        logger.warn('execute', `stale selector ${action.selector} no longer matches intended element; rejecting`);
+        logger.warn('execute', `stale selector ${action.selector} has ${candidates.length} matches in updated DOM; rejecting for safety`);
         return {
-          action: { action: 'invalid', reason: `target element moved or vanished during inference (${action.selector})` },
+          action: { action: 'invalid', reason: `target element ambiguous or vanished after DOM change (${action.selector})` },
           preDom: immediatePreDom,
           postDom: immediatePreDom,
         };
@@ -598,18 +607,44 @@ async function applyDecision(
 
   // Adaptive settlement for state-changing actions
   await sleep(100);
-  let postDom = immediatePreDom;
-  try {
-    let post = await scrape(tabId);
-    if (action.action === 'click' || action.action === 'fill' || action.action === 'navigate') {
-      if (fingerprint(immediatePreDom) === fingerprint(post.dom)) {
-         await sleep(350);
-         post = await scrape(tabId);
+  let postDom: ScrubbedDom | undefined;
+
+  if (action.action === 'navigate') {
+    await waitForTabReady(tabId);
+    await ensureContentScript(tabId);
+  }
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      let post = await scrape(tabId);
+      if (action.action === 'click' || action.action === 'fill' || action.action === 'navigate') {
+        if (fingerprint(immediatePreDom) === fingerprint(post.dom) && attempt < 3) {
+          await sleep(350);
+          continue;
+        }
+      }
+      postDom = post.dom;
+      break;
+    } catch (err) {
+      logger.warn('execute', `post-execution scrape attempt ${attempt} failed: ${err instanceof Error ? err.message : String(err)}`);
+      if (attempt < 3) {
+        await waitForTabReady(tabId, 2000);
+        await ensureContentScript(tabId);
+        await sleep(200);
       }
     }
-    postDom = post.dom;
-  } catch (err) {
-    logger.warn('execute', `post-execution scrape failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  if (!postDom) {
+    if (action.action === 'navigate' || action.action === 'click' || action.action === 'fill') {
+      postDom = {
+        ...immediatePreDom,
+        url: action.action === 'navigate' ? action.url : immediatePreDom.url,
+        nodes: [],
+      };
+    } else {
+      postDom = immediatePreDom;
+    }
   }
 
   return { action, preDom: immediatePreDom, postDom };
@@ -714,7 +749,7 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
 
       // Measure exact DOM change caused by THIS action alone
       const isActionWaitOrDone = action.action === 'wait' || action.action === 'escalate';
-      const stateChanged = fingerprint(result.preDom) !== fingerprint(result.postDom);
+      const stateChanged = action.action === 'navigate' || fingerprint(result.preDom) !== fingerprint(result.postDom);
       let resultCategory: ActionResultCategory = action.action === 'invalid' ? 'failed' : (stateChanged ? 'state_changed' : (isActionWaitOrDone ? 'uncertain' : 'no_change'));
 
       taskMemory.lastAction = { action, result: resultCategory };
