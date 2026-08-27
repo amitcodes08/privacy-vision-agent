@@ -339,6 +339,20 @@ const reasonOf = (d: AgentDecision): string | undefined => {
   return undefined;
 };
 
+/** Identity of an action for loop detection — kind plus target, no reason text. */
+const fingerprint = (a: AgentAction): string =>
+  'selector' in a && a.selector ? `${a.action}:${a.selector}` : a.action;
+
+/** How many times the most recent action repeats consecutively at the tail. */
+function repeatedTail(history: readonly AgentAction[]): number {
+  const last = history.at(-1);
+  if (!last) return 0;
+  const key = fingerprint(last);
+  let n = 0;
+  for (let i = history.length - 1; i >= 0 && fingerprint(history[i]!) === key; i--) n++;
+  return n;
+}
+
 async function applyDecision(tabId: number, decision: AgentDecision): Promise<AgentAction> {
   status.lastDecision = decision;
   const action = decision.action;
@@ -370,6 +384,15 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
       const action = await step(tabId, goal, history, settings);
       history.push(action);
       if (action.action === 'done') break;
+
+      // Stuck-loop guard. Without this, an agent repeating one ineffective
+      // action burns the whole step budget — and every one of those steps that
+      // fell through to escalation was a wasted upload.
+      if (repeatedTail(history) >= 3) {
+        logger.warn('agent', `same action ${fingerprint(action)} three times; stopping`);
+        break;
+      }
+
       if (action.action === 'wait') await sleep(Math.min(action.ms, 5_000));
       else await sleep(400); // let the page settle before re-observing
     }
