@@ -109,6 +109,7 @@ export interface OffscreenInferRequest {
   /** data: URL of the *unredacted* local frame. Never forwarded onward. */
   frameDataUrl?: string;
   history?: AgentAction[];
+  taskMemory?: import('@shared/types').TaskMemory;
 }
 
 chrome.runtime.onMessage.addListener((message: OffscreenInferRequest, _sender, sendResponse) => {
@@ -137,6 +138,7 @@ chrome.runtime.onMessage.addListener((message: OffscreenInferRequest, _sender, s
               dom: message.dom,
               frame: bitmap,
               history: message.history ?? [],
+              taskMemory: message.taskMemory,
             },
             'DECISION',
             [bitmap],

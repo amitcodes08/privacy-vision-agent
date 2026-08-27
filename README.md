@@ -61,7 +61,7 @@ captureVisibleTab ──raw frame──► offscreen ► WebGPU worker ► SmolV
 | [client/src/ai/decision-parser.ts](client/src/ai/decision-parser.ts) | Prompt building, model text → action, selector repair + confidence |
 | [client/src/ai/local-planner.ts](client/src/ai/local-planner.ts) | Keyword ranker: grounds active sub-goal in prompt and corroborates |
 | [client/src/ai/vlm-worker.ts](client/src/ai/vlm-worker.ts) | Worker that owns the WebGPU context and weights |
-| [client/src/scripts/copy-ort.mjs](client/scripts/copy-ort.mjs) | Vendors onnxruntime's WASM so MV3 never fetches code remotely |
+| [client/scripts/copy-ort.mjs](client/scripts/copy-ort.mjs) | Vendors onnxruntime's WASM so MV3 never fetches code remotely |
 | [client/src/offscreen/main.ts](client/src/offscreen/main.ts) | Offscreen host — the SW cannot own a GPU context |
 | [client/src/background/index.ts](client/src/background/index.ts) | Orchestrator: query planning, sub-objective progression, escalation ladder |
 | [client/src/network/ws-client.ts](client/src/network/ws-client.ts) | One socket, bounded reconnect ladder, request correlation |

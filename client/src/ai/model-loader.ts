@@ -218,19 +218,20 @@ export interface GenerateArgs {
   dom: ScrubbedDom;
   history?: AgentAction[];
   maxNewTokens?: number;
+  taskMemory?: import('@shared/types').TaskMemory;
 }
 
 export async function generateDecision(args: GenerateArgs): Promise<AgentDecision & { raw: string }> {
-  const { loaded, image, goal, dom, history = [], maxNewTokens = 64 } = args;
+  const { loaded, image, goal, dom, history = [], maxNewTokens = 64, taskMemory } = args;
   const t0 = performance.now();
   const processor = loaded.processor as unknown as ProcessorView;
   const model = loaded.model as unknown as ModelView;
 
   // One ranking serves both jobs: choosing which elements the model gets to
   // see, and afterwards corroborating whichever one it picked.
-  const ranking = rankCandidates({ goal, dom, history });
+  const ranking = rankCandidates({ goal, dom, history, taskMemory });
 
-  const prompt = buildPrompt(goal, dom, history, ranking);
+  const prompt = buildPrompt(goal, dom, history, ranking, taskMemory);
   const messages = [{ role: 'user', content: [{ type: 'image' }, { type: 'text', text: prompt }] }];
   const text = processor.apply_chat_template(messages, { add_generation_prompt: true });
   const inputs = await processor(text, [image], { do_image_splitting: false });
@@ -238,7 +239,7 @@ export async function generateDecision(args: GenerateArgs): Promise<AgentDecisio
   const output = await model.generate({ ...inputs, max_new_tokens: maxNewTokens, do_sample: false });
 
   const raw = decodeCompletion(processor, inputs, output);
-  const { action, confidence } = parseAction(raw, dom, { goal, history, ranking });
+  const { action, confidence } = parseAction(raw, dom, { goal, history, ranking, taskMemory });
   return {
     action,
     confidence,

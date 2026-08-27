@@ -30,6 +30,17 @@ interface WindowWithAI {
   };
 }
 
+const NANO_PROBE_TIMEOUT_MS = 1500;
+const NANO_PROMPT_TIMEOUT_MS = 3500;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<T>((resolve) => {
+    timer = setTimeout(() => resolve(fallback), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 /**
  * Checks if Chrome Built-in AI (Gemini Nano) is available in the current environment.
  */
@@ -39,12 +50,12 @@ export async function isGeminiNanoAvailable(): Promise<boolean> {
     if (!ai || typeof ai.create !== 'function') return false;
 
     if (typeof ai.availability === 'function') {
-      const state = await ai.availability();
+      const state = await withTimeout(ai.availability(), NANO_PROBE_TIMEOUT_MS, 'no' as const);
       return state === 'readily';
     }
 
     if (typeof ai.capabilities === 'function') {
-      const caps = await ai.capabilities();
+      const caps = await withTimeout(ai.capabilities(), NANO_PROBE_TIMEOUT_MS, { available: 'no' as const });
       return caps.available === 'readily';
     }
 
@@ -71,28 +82,34 @@ export async function decomposeGoal(goal: string): Promise<DecomposedPlan> {
     return { subObjectives: [], source: 'local-rules' };
   }
 
-  // 1. Attempt Chrome Built-in Gemini Nano
+  // 1. Attempt Chrome Built-in Gemini Nano with bounded timeouts
   try {
     const nanoReady = await isGeminiNanoAvailable();
     if (nanoReady) {
       const ai = (globalThis as unknown as WindowWithAI).ai?.languageModel;
-      const session = await ai?.create?.({
-        systemPrompt: SYSTEM_PROMPT,
-        temperature: 0,
-      });
+      const session = await withTimeout(
+        ai?.create?.({
+          systemPrompt: SYSTEM_PROMPT,
+          temperature: 0,
+        }) ?? Promise.resolve(undefined),
+        NANO_PROMPT_TIMEOUT_MS,
+        undefined,
+      );
 
       if (session) {
-        const raw = await session.prompt(`Goal: ${trimmed}`);
-        session.destroy?.();
-
-        const parsed = parseJsonArray(raw);
-        if (parsed && parsed.length > 0) {
-          const subObjectives: TaskObjective[] = parsed.map((desc, idx) => ({
-            id: idx + 1,
-            description: desc,
-            status: idx === 0 ? 'active' : 'pending',
-          }));
-          return { subObjectives, source: 'gemini-nano' };
+        try {
+          const raw = await withTimeout(session.prompt(`Goal: ${trimmed}`), NANO_PROMPT_TIMEOUT_MS, '');
+          const parsed = parseJsonArray(raw);
+          if (parsed && parsed.length > 0) {
+            const subObjectives: TaskObjective[] = parsed.map((desc, idx) => ({
+              id: idx + 1,
+              description: desc,
+              status: idx === 0 ? 'active' : 'pending',
+            }));
+            return { subObjectives, source: 'gemini-nano' };
+          }
+        } finally {
+          session.destroy?.();
         }
       }
     }

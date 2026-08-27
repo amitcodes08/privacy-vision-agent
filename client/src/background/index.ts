@@ -345,10 +345,8 @@ function frameOnce(): () => Promise<string> {
  */
 interface StepResult {
   action: AgentAction;
-  /** The ScrubbedDom produced by the scrape at the start of this step.
-   *  Returned so runAgent can pass it to the next iteration's termination
-   *  check without performing a redundant scrape. */
-  dom: ScrubbedDom;
+  preDom: ScrubbedDom;
+  postDom: ScrubbedDom;
 }
 
 async function step(tabId: number, goal: string, history: AgentAction[], settings: Settings, taskMemory: TaskMemory): Promise<StepResult> {
@@ -385,18 +383,13 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
 
   if (decision && decision.confidence >= settings.confidenceThreshold && decision.action.action !== 'escalate') {
     // --- VLM-done corroboration: verify a done signal against the DOM ------
-    // When the VLM says the goal is complete, run the cheap termination checker
-    // against the DOM we just scraped. This prevents two failure modes:
-    //   a) VLM done + low confidence → falls through to planner → escalation →
-    //      unnecessary cloud action (the primary bug).
-    //   b) VLM done but DOM clearly shows the goal is NOT met → blind trust.
     if (decision.action.action === 'done') {
-      const domSignal = checkTermination({ goal, dom, history });
+      const domSignal = checkTermination({ goal, dom, history, taskMemory });
       const corroborated = corroborateDone(decision.confidence, domSignal);
       if (corroborated.done && corroborated.confidence >= HIGH_CONFIDENCE) {
         logger.info('local', `vlm done corroborated by dom (${corroborated.reason}); stopping`);
         status.localDecisions++;
-        return { action: decision.action, dom };
+        return { action: decision.action, preDom: dom, postDom: dom };
       }
       if (!corroborated.done) {
         // DOM contradicts — treat as if the VLM did not decide.
@@ -404,26 +397,19 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
           'local',
           `vlm says done but dom contradicts (${corroborated.reason}); continuing`,
         );
-        // Fall through to planner/escalation with the corroboration evidence.
         decision = null;
       } else {
-        // DOM is uncertain — return the VLM done anyway with its own confidence.
-        // The confidence gate above already passed, so return it.
         status.localDecisions++;
-        return { action: decision.action, dom };
+        return { action: decision.action, preDom: dom, postDom: dom };
       }
     } else {
       status.localDecisions++;
-      return { action: await applyDecision(tabId, decision, dom), dom };
+      const applied = await applyDecision(tabId, decision, dom);
+      return { action: applied.action, preDom: dom, postDom: applied.postDom };
     }
   }
 
   // --- Path 2: no usable model, so plan on-device -----------------
-  // Only when the VLM could not produce a decision at all: not loaded yet,
-  // errored, or emitted nothing parseable. A model that *did* choose an element
-  // and is merely hesitant is not overridden here — a keyword match is not
-  // better evidence than a vision model that read the page, and escalation
-  // exists precisely for that case.
   const vlmUnusable = !decision || decision.confidence === 0;
   const planned = vlmUnusable ? planLocally({ goal, dom, history, taskMemory }) : null;
   if (planned) {
@@ -434,7 +420,8 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
     );
     if (planned.confidence >= Math.max(settings.confidenceThreshold, 0.60) && planned.action.action !== 'escalate') {
       status.heuristicDecisions++;
-      return { action: await applyDecision(tabId, planned, dom), dom };
+      const applied = await applyDecision(tabId, planned, dom);
+      return { action: applied.action, preDom: dom, postDom: applied.postDom };
     }
   }
 
@@ -442,20 +429,17 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
   const onDevice = () => pickActionable(decision, planned) ?? pickActionable(planLocally({ goal, dom, history }), null);
 
   // --- Path 3: redact, then escalate -----------------------------
-  // `escalationsOff` covers both the setting and the circuit breaker: once the
-  // server has failed twice in a run it is not coming back, and every further
-  // attempt costs a redaction pass plus a 3s connect timeout per step for
-  // nothing.
   if (!settings.allowEscalation || escalationDown) {
     const fallback = onDevice();
     if (fallback) {
       if (fallback.source === 'heuristic') status.heuristicDecisions++;
       else status.localDecisions++;
       logger.info('escalate', `${escalationDown ? 'server unreachable' : 'disabled'}; acting on the best on-device decision`);
-      return { action: await applyDecision(tabId, fallback, dom), dom };
+      const applied = await applyDecision(tabId, fallback, dom);
+      return { action: applied.action, preDom: dom, postDom: applied.postDom };
     }
     logger.warn('escalate', 'unavailable and nothing actionable on-device; stopping');
-    return { action: { action: 'done', summary: 'low confidence and no escalation available' }, dom };
+    return { action: { action: 'done', summary: 'low confidence and no escalation available' }, preDom: dom, postDom: dom };
   }
 
   const rawFrame = await frame();
@@ -475,9 +459,6 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
 
   ws ??= makeWsClient(settings);
   try {
-    // No explicit connect(): `infer` connects on demand. Calling it here on
-    // every step is what spawned a second socket mid-backoff and turned one
-    // failed connection into a reconnect storm.
     const response = await ws.infer({
       goal,
       imageBase64: redacted.base64,
@@ -490,13 +471,11 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
     });
     escalationFailures = 0;
     status.escalations++;
-    // Sanitise the cloud response before acting: strip fill-specific fields
-    // from click actions and other semantic inconsistencies.
     const cloudDecision = sanitiseCloudAction(response.decision);
     logger.info('escalate', `cloud decision ${cloudDecision.action.action}`, response.rationale);
-    return { action: await applyDecision(tabId, cloudDecision, dom), dom };
+    const applied = await applyDecision(tabId, cloudDecision, dom);
+    return { action: applied.action, preDom: dom, postDom: applied.postDom };
   } catch (err) {
-    // The server is a convenience, not a dependency. Fall back on-device.
     escalationFailures++;
     if (escalationFailures >= MAX_ESCALATION_FAILURES) {
       escalationDown = true;
@@ -508,9 +487,10 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
     if (fallback) {
       if (fallback.source === 'heuristic') status.heuristicDecisions++;
       else status.localDecisions++;
-      return { action: await applyDecision(tabId, fallback, dom), dom };
+      const applied = await applyDecision(tabId, fallback, dom);
+      return { action: applied.action, preDom: dom, postDom: applied.postDom };
     }
-    return { action: { action: 'done', summary: 'no decision available on-device and escalation failed' }, dom };
+    return { action: { action: 'done', summary: 'no decision available on-device and escalation failed' }, preDom: dom, postDom: dom };
   }
 }
 
@@ -548,27 +528,34 @@ function repeatedTail(history: readonly AgentAction[]): number {
   return n;
 }
 
-async function applyDecision(tabId: number, decision: AgentDecision, preDom?: ScrubbedDom): Promise<AgentAction> {
+async function applyDecision(
+  tabId: number,
+  decision: AgentDecision,
+  preDom: ScrubbedDom,
+): Promise<{ action: AgentAction; postDom: ScrubbedDom }> {
   status.lastDecision = decision;
   const action = decision.action;
-  if (action.action === 'done' || action.action === 'escalate' || action.action === 'invalid') return action;
+  if (action.action === 'done' || action.action === 'escalate' || action.action === 'invalid') {
+    return { action, postDom: preDom };
+  }
   
   const res = await execute(tabId, action);
   if (!res.ok) {
     logger.warn('execute', `${action.action} failed`, res.error);
-    return { action: 'invalid', reason: res.error || 'execution failed' };
+    return { action: { action: 'invalid', reason: res.error || 'execution failed' }, postDom: preDom };
   }
 
   // Adaptive settlement for state-changing actions
-  if (preDom && (action.action === 'click' || action.action === 'fill' || action.action === 'navigate')) {
-    const immediate = await scrape(tabId);
-    if (fingerprint(preDom) === fingerprint(immediate.dom)) {
+  let post = await scrape(tabId);
+  if (action.action === 'click' || action.action === 'fill' || action.action === 'navigate') {
+    if (fingerprint(preDom) === fingerprint(post.dom)) {
        // State unchanged immediately, give it a short time to settle
        await sleep(400);
+       post = await scrape(tabId);
     }
   }
 
-  return action;
+  return { action, postDom: post.dom };
 }
 
 
@@ -586,41 +573,34 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
   status.lastError = undefined;
   const history: AgentAction[] = [];
 
-  // Decompose complex query using Chrome Built-in Gemini Nano or rule-based fallback
-  const plan = await decomposeGoal(goal);
-  const taskMemory: TaskMemory = {
-    goal,
-    subObjectives: plan.subObjectives,
-    planSource: plan.source,
-    currentObjective: plan.subObjectives[0]?.description,
-    completedObjectives: [],
-    attemptedTargets: [],
-    step: 0,
-  };
-
-  logger.info(
-    'plan',
-    `decomposed goal via ${plan.source} into ${plan.subObjectives.length} sub-objectives: ${plan.subObjectives.map((s) => s.description).join(' -> ')}`,
-  );
-
-  // --- Termination / stagnation state ----------------------------------
-  // `prevDom` is the ScrubbedDom produced by the *previous* step's scrape.
-  // We pass it to the termination checker so it can detect delta changes
-  let prevDom: ScrubbedDom | undefined;
-  let invalidCount = 0;
-  const stagnation = makeStagnationState();
-
   try {
-    // Kick off (or join) the model load, but do not block the run on it: the
-    // on-device planner can already act while weights download.
+    // Decompose complex query using Chrome Built-in Gemini Nano or rule-based fallback
+    const plan = await decomposeGoal(goal);
+    const taskMemory: TaskMemory = {
+      goal,
+      subObjectives: plan.subObjectives,
+      planSource: plan.source,
+      currentObjective: plan.subObjectives[0]?.description,
+      completedObjectives: [],
+      attemptedTargets: [],
+      step: 0,
+    };
+
+    logger.info(
+      'plan',
+      `decomposed goal via ${plan.source} into ${plan.subObjectives.length} sub-objectives: ${plan.subObjectives.map((s) => s.description).join(' -> ')}`,
+    );
+
+    let prevDom: ScrubbedDom | undefined;
+    let invalidCount = 0;
+    const stagnation = makeStagnationState();
+
     if (!modelReady) void warmUpLocalModel(settings);
 
     for (let i = 0; i < settings.maxSteps && !stopRequested; i++) {
       status.step = i + 1;
 
-      // --- Cheap termination check (runs before VLM, zero extra I/O) -----
-      // Uses the ScrubbedDom cached from the *previous* step's scrape.
-      // On the first iteration prevDom is undefined, so the check is skipped.
+      // Pre-step termination check
       if (prevDom !== undefined) {
         const signal = checkTermination({
           goal,
@@ -637,14 +617,12 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
       }
 
       taskMemory.step = i + 1;
-      const stepPrevDom = prevDom; // DOM from before this step, for delta checks
       const result = await step(tabId, goal, history, settings, taskMemory);
       const action = result.action;
       history.push(action);
 
-      // Update prevDom with the DOM scraped during this step.
-      // The termination checker on the *next* iteration will use it.
-      prevDom = result.dom;
+      // prevDom for next step
+      prevDom = result.postDom;
 
       // If the model emitted done, check if there are subsequent sub-objectives
       if (action.action === 'done') {
@@ -662,16 +640,13 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
         break;
       }
 
-      // --- Post-step completion check (primary termination mechanism) -------
-      // Run the cheap deterministic checker against the DOM that was just
-      // scraped during this step — *after* the action executed and *before*
-      // starting another VLM inference.
+      // Post-step completion check
       const postSignal = checkTermination({
         goal,
-        dom: result.dom,
+        dom: result.postDom,
         lastAction: action,
         history,
-        prevDom: stepPrevDom,
+        prevDom: result.preDom,
         taskMemory,
       });
       if (postSignal.done && postSignal.confidence >= HIGH_CONFIDENCE) {
@@ -680,9 +655,9 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
         break;
       }
 
-      // --- Action Result Validation & Repeat Guard ----------------------
+      // Measure exact DOM change caused by THIS action alone
       const isActionWaitOrDone = action.action === 'wait' || action.action === 'escalate';
-      const stateChanged = stepPrevDom && fingerprint(stepPrevDom) !== fingerprint(result.dom);
+      const stateChanged = fingerprint(result.preDom) !== fingerprint(result.postDom);
       let resultCategory: ActionResultCategory = action.action === 'invalid' ? 'failed' : (stateChanged ? 'state_changed' : (isActionWaitOrDone ? 'uncertain' : 'no_change'));
 
       taskMemory.lastAction = { action, result: resultCategory };
@@ -690,12 +665,21 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
       if (resultCategory === 'state_changed') {
         taskMemory.attemptedTargets = [];
         
-        // Progress sub-objectives on meaningful state change or explicit completion
+        // Progress sub-objectives when verified
         if (taskMemory.subObjectives && taskMemory.subObjectives.length > 0) {
           const activeIndex = taskMemory.subObjectives.findIndex((s) => s.status === 'active');
           if (activeIndex !== -1) {
             const currentSub = taskMemory.subObjectives[activeIndex];
-            if (action.completedObjective || action.action === 'click' || action.action === 'fill' || action.action === 'navigate') {
+            // Check if current sub-objective is fulfilled (explicitly or via sub-goal check)
+            const subSignal = checkTermination({
+              goal: currentSub.description,
+              dom: result.postDom,
+              lastAction: action,
+              prevDom: result.preDom,
+              history,
+            });
+            const isSubCompleted = Boolean(action.completedObjective) || (subSignal.done && subSignal.confidence >= HIGH_CONFIDENCE);
+            if (isSubCompleted) {
               currentSub.status = 'completed';
               taskMemory.completedObjectives.push({ description: currentSub.description, status: 'completed' });
               logger.info('task', `completed sub-objective [${activeIndex + 1}/${taskMemory.subObjectives.length}]: ${currentSub.description}`);
@@ -764,8 +748,6 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
   } finally {
     running = false;
     status.running = false;
-    // Nothing wants the socket between runs, and leaving it open meant its
-    // reconnect ladder kept firing long after the agent had stopped.
     ws?.close();
   }
 }
