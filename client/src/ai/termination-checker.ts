@@ -51,6 +51,7 @@ export interface CheckInput {
   history?: AgentAction[];
   /** DOM from before the last action, when available, for delta checks. */
   prevDom?: ScrubbedDom;
+  taskMemory?: import('@shared/types').TaskMemory;
 }
 
 /**
@@ -80,16 +81,35 @@ const UNKNOWN: TerminationSignal = {
 const NOT_DONE = (reason: string): TerminationSignal => ({ done: false, confidence: 0, reason });
 const DONE = (confidence: number, reason: string): TerminationSignal => ({ done: true, confidence, reason });
 
+const COMPOUND_GOAL_PATTERN = /\b(?:and\s+then|then|after\s+that|followed\s+by|;\s*|\s*->\s*)\b/i;
+const MULTI_ACTION_PATTERN = /\b(?:search|find|navigate|go\s+to|visit)\b.*\b(?:and\s+|,\s*and\s+)(?:add|checkout|click|fill|type|buy|select|submit|choose)\b/i;
+
+function isCompoundGoal(goal: string, taskMemory?: import('@shared/types').TaskMemory): boolean {
+  if (taskMemory?.subObjectives && taskMemory.subObjectives.length > 1) {
+    return true;
+  }
+  return COMPOUND_GOAL_PATTERN.test(goal) || MULTI_ACTION_PATTERN.test(goal);
+}
+
 /* ------------------------------------------------------------------ *
  * Orchestrator
  * ------------------------------------------------------------------ */
 
 function _check(input: CheckInput): TerminationSignal {
-  const { goal, dom, lastAction, prevDom, history = [] } = input;
+  const { goal, dom, lastAction, prevDom, history = [], taskMemory } = input;
 
   if (lastAction?.action === 'done') return DONE(1, 'last action was done');
   if (lastAction?.action === 'wait') return NOT_DONE('last action was wait — page may still be loading');
 
+  // Multi-step safety: if there are pending sub-objectives, the overarching task cannot be complete
+  if (taskMemory?.subObjectives && taskMemory.subObjectives.length > 1) {
+    const pending = taskMemory.subObjectives.filter((s) => s.status !== 'completed');
+    if (pending.length > 0) {
+      return NOT_DONE(`${pending.length} sub-objectives still pending`);
+    }
+  }
+
+  const compound = isCompoundGoal(goal, taskMemory);
   const literal = literalFor(goal);
   const tokens = tokenize(goal);
 
@@ -100,9 +120,9 @@ function _check(input: CheckInput): TerminationSignal {
     let foundInStaticState = false;
     let foundInInput = false;
 
-    // Check title and URL first
-    if (dom.title.toLowerCase().includes(literalLower) || 
-        decodeURIComponent(dom.url).toLowerCase().includes(literalLower)) {
+    // Check title and URL first only for non-compound goals
+    if (!compound && (dom.title.toLowerCase().includes(literalLower) || 
+        decodeURIComponent(dom.url).toLowerCase().includes(literalLower))) {
       foundInStaticState = true;
     }
 
@@ -118,8 +138,9 @@ function _check(input: CheckInput): TerminationSignal {
       }
     }
 
-    // If the literal appears in the static DOM (e.g. list item, heading, URL), that is strong positive evidence.
-    if (foundInStaticState) {
+    // If the literal appears in the static DOM (e.g. list item, heading), that is strong positive evidence.
+    // For compound goals (e.g. search + add to cart), finding the search term is not sufficient to declare the whole task done.
+    if (foundInStaticState && !compound) {
       return DONE(0.8, `found requested literal "${literal}" in page state`);
     }
 
@@ -134,7 +155,8 @@ function _check(input: CheckInput): TerminationSignal {
   }
 
   // 2. State Change Evidence (e.g., "Navigate to billing")
-  if (history.length > 0 && prevDom && tokens.length > 0) {
+  // Only apply navigation token matching for single-step navigation goals, not compound workflows
+  if (!compound && history.length > 0 && prevDom && tokens.length > 0) {
     const prevUrl = new URL(prevDom.url);
     const currUrl = new URL(dom.url);
     

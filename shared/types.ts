@@ -119,8 +119,9 @@ export interface AgentDecision {
  * ------------------------------------------------------------------ */
 
 export interface TaskObjective {
+  id?: number;
   description: string;
-  status: 'active' | 'completed';
+  status: 'pending' | 'active' | 'completed';
 }
 
 export type ActionResultCategory = 'state_changed' | 'no_change' | 'failed' | 'uncertain';
@@ -128,7 +129,9 @@ export type ActionResultCategory = 'state_changed' | 'no_change' | 'failed' | 'u
 export interface TaskMemory {
   goal: string;
   currentObjective?: string;
+  subObjectives?: TaskObjective[];
   completedObjectives: TaskObjective[];
+  planSource?: 'gemini-nano' | 'local-rules' | 'cloud';
   lastAction?: {
     action: AgentAction;
     result: ActionResultCategory;

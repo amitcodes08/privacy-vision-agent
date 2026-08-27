@@ -323,3 +323,51 @@ describe('stagnation-guard — REG-TC-9 same fingerprint 3+ times', () => {
     expect(stagnant).toBe(true);
   });
 });
+
+describe('checkTermination — Multi-Step & Compound Goal Safety', () => {
+  it('does NOT terminate early on compound goal when search results appear', () => {
+    const searchResultDom = makeDom(
+      'https://shop.test/search?q=headphones',
+      'Search results for headphones',
+      [
+        node({ id: 0, selector: '.item-1', tag: 'a', text: 'Sony Noise Cancelling Headphones' }),
+        node({ id: 1, selector: '.add-cart', tag: 'button', text: 'Add to Cart' }),
+      ],
+    );
+
+    const signal = checkTermination({
+      goal: 'Search for headphones and add to cart',
+      dom: searchResultDom,
+      history: [{ action: 'fill', selector: 'input[name=q]', value: 'headphones', valueType: 'LITERAL' }],
+      prevDom: makeDom('https://shop.test/', 'Shop Home', [node({ id: 0, selector: 'input[name=q]', tag: 'input' })]),
+    });
+
+    // Should NOT be done because "add to cart" has not happened yet!
+    expect(signal.done).toBe(false);
+  });
+
+  it('does NOT terminate when TaskMemory has pending sub-objectives', () => {
+    const dom = makeDom('https://shop.test/search', 'Search', [
+      node({ id: 0, selector: '#cart', tag: 'button', text: 'Cart' }),
+    ]);
+
+    const signal = checkTermination({
+      goal: 'Search for shoes and add to cart',
+      dom,
+      taskMemory: {
+        goal: 'Search for shoes and add to cart',
+        subObjectives: [
+          { id: 1, description: 'Search for shoes', status: 'completed' },
+          { id: 2, description: 'Add to cart', status: 'pending' },
+        ],
+        completedObjectives: [{ description: 'Search for shoes', status: 'completed' }],
+        attemptedTargets: [],
+        step: 2,
+      },
+    });
+
+    expect(signal.done).toBe(false);
+    expect(signal.reason).toContain('sub-objectives still pending');
+  });
+});
+

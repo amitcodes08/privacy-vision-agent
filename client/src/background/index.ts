@@ -28,6 +28,7 @@ import { logger, recentLogs } from '~/lib/log';
 import { checkTermination, corroborateDone, HIGH_CONFIDENCE } from '~/ai/termination-checker';
 import { makeStagnationState, recordAndCheck, fingerprint } from '~/ai/stagnation-guard';
 import { sanitiseCloudAction } from '~/ai/decision-parser';
+import { decomposeGoal } from '~/ai/nano-query-planner';
 
 const OFFSCREEN_PATH = 'src/offscreen/index.html';
 
@@ -584,12 +585,23 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
   status.maxSteps = settings.maxSteps;
   status.lastError = undefined;
   const history: AgentAction[] = [];
+
+  // Decompose complex query using Chrome Built-in Gemini Nano or rule-based fallback
+  const plan = await decomposeGoal(goal);
   const taskMemory: TaskMemory = {
     goal,
+    subObjectives: plan.subObjectives,
+    planSource: plan.source,
+    currentObjective: plan.subObjectives[0]?.description,
     completedObjectives: [],
     attemptedTargets: [],
     step: 0,
   };
+
+  logger.info(
+    'plan',
+    `decomposed goal via ${plan.source} into ${plan.subObjectives.length} sub-objectives: ${plan.subObjectives.map((s) => s.description).join(' -> ')}`,
+  );
 
   // --- Termination / stagnation state ----------------------------------
   // `prevDom` is the ScrubbedDom produced by the *previous* step's scrape.
@@ -615,6 +627,7 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
           dom: prevDom,
           lastAction: history.at(-1),
           history,
+          taskMemory,
         });
         if (signal.done && signal.confidence >= HIGH_CONFIDENCE) {
           logger.info('termination', `early exit before step ${i + 1}: ${signal.reason}`);
@@ -633,24 +646,33 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
       // The termination checker on the *next* iteration will use it.
       prevDom = result.dom;
 
-      if (action.action === 'done') break;
+      // If the model emitted done, check if there are subsequent sub-objectives
+      if (action.action === 'done') {
+        if (taskMemory.subObjectives && taskMemory.subObjectives.length > 0) {
+          const activeIndex = taskMemory.subObjectives.findIndex((s) => s.status === 'active');
+          if (activeIndex !== -1 && activeIndex + 1 < taskMemory.subObjectives.length) {
+            taskMemory.subObjectives[activeIndex].status = 'completed';
+            taskMemory.completedObjectives.push({ description: taskMemory.subObjectives[activeIndex].description, status: 'completed' });
+            taskMemory.subObjectives[activeIndex + 1].status = 'active';
+            taskMemory.currentObjective = taskMemory.subObjectives[activeIndex + 1].description;
+            logger.info('task', `sub-objective completed; advancing to [${activeIndex + 2}/${taskMemory.subObjectives.length}]: ${taskMemory.currentObjective}`);
+            continue;
+          }
+        }
+        break;
+      }
 
       // --- Post-step completion check (primary termination mechanism) -------
       // Run the cheap deterministic checker against the DOM that was just
       // scraped during this step — *after* the action executed and *before*
-      // starting another VLM inference. This is the fix for the observed bug:
-      // the loop was allowed to continue because the pre-step check used the
-      // *previous* step's DOM, and by the time the next pre-step check ran the
-      // VLM had already started (and the planner/escalation path was triggered).
-      //
-      // Zero extra I/O: result.dom is already available from the scrape that
-      // happened inside step().
+      // starting another VLM inference.
       const postSignal = checkTermination({
         goal,
         dom: result.dom,
         lastAction: action,
         history,
         prevDom: stepPrevDom,
+        taskMemory,
       });
       if (postSignal.done && postSignal.confidence >= HIGH_CONFIDENCE) {
         logger.info('termination', `post-step exit after step ${i + 1}: ${postSignal.reason}`);
@@ -659,8 +681,6 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
       }
 
       // --- Action Result Validation & Repeat Guard ----------------------
-      // If the action produced no meaningful state change, we shouldn't blindly repeat it.
-      // Unlike the emergency 3-repeat guard, this uses actual state reasoning.
       const isActionWaitOrDone = action.action === 'wait' || action.action === 'escalate';
       const stateChanged = stepPrevDom && fingerprint(stepPrevDom) !== fingerprint(result.dom);
       let resultCategory: ActionResultCategory = action.action === 'invalid' ? 'failed' : (stateChanged ? 'state_changed' : (isActionWaitOrDone ? 'uncertain' : 'no_change'));
@@ -669,13 +689,35 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
 
       if (resultCategory === 'state_changed') {
         taskMemory.attemptedTargets = [];
-        if (action.completedObjective) {
-          taskMemory.completedObjectives.push({ description: action.completedObjective, status: 'completed' });
-          logger.info('task', `objective completed: ${action.completedObjective}`);
-        }
-        if (action.currentObjective) {
-          taskMemory.currentObjective = action.currentObjective;
-          logger.info('task', `next objective: ${action.currentObjective}`);
+        
+        // Progress sub-objectives on meaningful state change or explicit completion
+        if (taskMemory.subObjectives && taskMemory.subObjectives.length > 0) {
+          const activeIndex = taskMemory.subObjectives.findIndex((s) => s.status === 'active');
+          if (activeIndex !== -1) {
+            const currentSub = taskMemory.subObjectives[activeIndex];
+            if (action.completedObjective || action.action === 'click' || action.action === 'fill' || action.action === 'navigate') {
+              currentSub.status = 'completed';
+              taskMemory.completedObjectives.push({ description: currentSub.description, status: 'completed' });
+              logger.info('task', `completed sub-objective [${activeIndex + 1}/${taskMemory.subObjectives.length}]: ${currentSub.description}`);
+
+              const nextIndex = activeIndex + 1;
+              if (nextIndex < taskMemory.subObjectives.length) {
+                taskMemory.subObjectives[nextIndex].status = 'active';
+                taskMemory.currentObjective = taskMemory.subObjectives[nextIndex].description;
+                logger.info('task', `advancing to next sub-objective [${nextIndex + 1}/${taskMemory.subObjectives.length}]: ${taskMemory.currentObjective}`);
+              } else {
+                taskMemory.currentObjective = undefined;
+                logger.info('task', 'all sub-objectives finished');
+              }
+            }
+          }
+        } else {
+          if (action.completedObjective) {
+            taskMemory.completedObjectives.push({ description: action.completedObjective, status: 'completed' });
+          }
+          if (action.currentObjective) {
+            taskMemory.currentObjective = action.currentObjective;
+          }
         }
       } else if (resultCategory === 'no_change' || resultCategory === 'failed') {
         if ('selector' in action && action.selector) {
@@ -705,9 +747,6 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
       }
 
       // --- Structural stagnation guard ----------------------------------
-      // Records a fingerprint of the page that was just scraped and checks
-      // whether the page has been stuck in the same structural state across
-      // multiple distinct actions.
       if (recordAndCheck(stagnation, prevDom, action, i)) {
         logger.warn(
           'agent',
