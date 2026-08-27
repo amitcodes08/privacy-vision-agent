@@ -405,7 +405,7 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
     } else {
       status.localDecisions++;
       const applied = await applyDecision(tabId, decision, dom);
-      return { action: applied.action, preDom: dom, postDom: applied.postDom };
+      return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom };
     }
   }
 
@@ -421,7 +421,7 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
     if (planned.confidence >= Math.max(settings.confidenceThreshold, 0.60) && planned.action.action !== 'escalate') {
       status.heuristicDecisions++;
       const applied = await applyDecision(tabId, planned, dom);
-      return { action: applied.action, preDom: dom, postDom: applied.postDom };
+      return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom };
     }
   }
 
@@ -436,7 +436,7 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
       else status.localDecisions++;
       logger.info('escalate', `${escalationDown ? 'server unreachable' : 'disabled'}; acting on the best on-device decision`);
       const applied = await applyDecision(tabId, fallback, dom);
-      return { action: applied.action, preDom: dom, postDom: applied.postDom };
+      return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom };
     }
     logger.warn('escalate', 'unavailable and nothing actionable on-device; stopping');
     return { action: { action: 'done', summary: 'low confidence and no escalation available' }, preDom: dom, postDom: dom };
@@ -474,7 +474,7 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
     const cloudDecision = sanitiseCloudAction(response.decision);
     logger.info('escalate', `cloud decision ${cloudDecision.action.action}`, response.rationale);
     const applied = await applyDecision(tabId, cloudDecision, dom);
-    return { action: applied.action, preDom: dom, postDom: applied.postDom };
+    return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom };
   } catch (err) {
     escalationFailures++;
     if (escalationFailures >= MAX_ESCALATION_FAILURES) {
@@ -488,7 +488,7 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
       if (fallback.source === 'heuristic') status.heuristicDecisions++;
       else status.localDecisions++;
       const applied = await applyDecision(tabId, fallback, dom);
-      return { action: applied.action, preDom: dom, postDom: applied.postDom };
+      return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom };
     }
     return { action: { action: 'done', summary: 'no decision available on-device and escalation failed' }, preDom: dom, postDom: dom };
   }
@@ -534,34 +534,85 @@ async function applyDecision(
   initialPreDom: ScrubbedDom,
 ): Promise<{ action: AgentAction; preDom: ScrubbedDom; postDom: ScrubbedDom }> {
   status.lastDecision = decision;
-  const action = decision.action;
+  let action = decision.action;
   if (action.action === 'done' || action.action === 'escalate' || action.action === 'invalid') {
     return { action, preDom: initialPreDom, postDom: initialPreDom };
   }
 
-  // Fresh pre-execution snapshot taken immediately before executing action
-  // to avoid attributing any asynchronous updates that settled during model inference.
-  const immediatePre = await scrape(tabId);
-  const preDom = immediatePre.dom;
-  
+  // Safe pre-execution snapshot: avoid unhandled rejection if tab navigated or disconnected during inference
+  let immediatePreDom = initialPreDom;
+  try {
+    const preScrape = await scrape(tabId);
+    immediatePreDom = preScrape.dom;
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    logger.warn('execute', `pre-execution scrape failed: ${errorMsg}`);
+    return {
+      action: { action: 'invalid', reason: errorMsg || 'tab unreachable before execution' },
+      preDom: initialPreDom,
+      postDom: initialPreDom,
+    };
+  }
+
+  // Reconcile stale selectors if DOM updated during inference
+  if ('selector' in action && action.selector && fingerprint(initialPreDom) !== fingerprint(immediatePreDom)) {
+    const origNode = initialPreDom.nodes.find((n) => n.selector === action.selector);
+    const targetNode = immediatePreDom.nodes.find((n) => n.selector === action.selector);
+
+    const isSameElement =
+      origNode &&
+      targetNode &&
+      origNode.tag === targetNode.tag &&
+      (origNode.name === targetNode.name || origNode.label === targetNode.label || origNode.text === targetNode.text);
+
+    if (!isSameElement && origNode) {
+      // Attempt to re-locate the intended element in the new DOM by matching key semantic attributes
+      const relocated = immediatePreDom.nodes.find(
+        (n) =>
+          n.tag === origNode.tag &&
+          ((origNode.label && n.label === origNode.label) ||
+           (origNode.name && n.name === origNode.name) ||
+           (origNode.placeholder && n.placeholder === origNode.placeholder) ||
+           (origNode.text && n.text === origNode.text)),
+      );
+
+      if (relocated) {
+        logger.info('execute', `reconciled stale selector ${action.selector} -> ${relocated.selector}`);
+        action = { ...action, selector: relocated.selector };
+      } else {
+        logger.warn('execute', `stale selector ${action.selector} no longer matches intended element; rejecting`);
+        return {
+          action: { action: 'invalid', reason: `target element moved or vanished during inference (${action.selector})` },
+          preDom: immediatePreDom,
+          postDom: immediatePreDom,
+        };
+      }
+    }
+  }
+
   const res = await execute(tabId, action);
   if (!res.ok) {
     logger.warn('execute', `${action.action} failed`, res.error);
-    return { action: { action: 'invalid', reason: res.error || 'execution failed' }, preDom, postDom: preDom };
+    return { action: { action: 'invalid', reason: res.error || 'execution failed' }, preDom: immediatePreDom, postDom: immediatePreDom };
   }
 
   // Adaptive settlement for state-changing actions
   await sleep(100);
-  let post = await scrape(tabId);
-  if (action.action === 'click' || action.action === 'fill' || action.action === 'navigate') {
-    if (fingerprint(preDom) === fingerprint(post.dom)) {
-       // State unchanged immediately, give it a short time to settle
-       await sleep(350);
-       post = await scrape(tabId);
+  let postDom = immediatePreDom;
+  try {
+    let post = await scrape(tabId);
+    if (action.action === 'click' || action.action === 'fill' || action.action === 'navigate') {
+      if (fingerprint(immediatePreDom) === fingerprint(post.dom)) {
+         await sleep(350);
+         post = await scrape(tabId);
+      }
     }
+    postDom = post.dom;
+  } catch (err) {
+    logger.warn('execute', `post-execution scrape failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  return { action, preDom, postDom: post.dom };
+  return { action, preDom: immediatePreDom, postDom };
 }
 
 
