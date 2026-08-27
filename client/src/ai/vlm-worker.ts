@@ -26,7 +26,7 @@ export type WorkerRequest =
 
 export type WorkerResponse =
   | { type: 'PROBE_RESULT'; id: string; webgpu: boolean; adapter?: string; reason?: string }
-  | { type: 'PROGRESS'; id: string; status: string; file?: string; progress?: number }
+  | { type: 'PROGRESS'; id: string; status: string; file?: string; progress?: number; loaded?: number; total?: number }
   | { type: 'READY'; id: string; modelId: string; device: string }
   | { type: 'DECISION'; id: string; decision: AgentDecision; raw: string }
   | { type: 'ERROR'; id: string; message: string };
@@ -56,21 +56,44 @@ async function handle(req: WorkerRequest): Promise<void> {
       }
       case 'INIT': {
         const key = req.modelKey && MODEL_REGISTRY[req.modelKey] ? req.modelKey : DEFAULT_MODEL_KEY;
-        loading ??= loadModel(key, (p) =>
-          post({ type: 'PROGRESS', id: req.id, status: p.status, file: p.file, progress: p.progress }),
-        );
-        loaded = await loading;
-        post({ type: 'READY', id: req.id, modelId: loaded.spec.id, device: loaded.device });
+        try {
+          loading ??= loadModel(key, (p) =>
+            post({
+              type: 'PROGRESS',
+              id: req.id,
+              status: p.status,
+              file: p.file,
+              progress: p.progress,
+              loaded: p.loaded,
+              total: p.total,
+            }),
+          );
+          loaded = await loading;
+          post({ type: 'READY', id: req.id, modelId: loaded.spec.id, device: loaded.device });
+        } catch (err) {
+          loading = null;
+          console.error('[vlm-worker] model loading failed:', err);
+          throw err;
+        }
         return;
       }
       case 'INFER': {
+        // A load already in flight is worth waiting for — bailing out here is
+        // what sent the very first steps of every run to the server.
+        if (!loaded && loading) {
+          loaded = await loading.catch(() => null);
+        }
         if (!loaded) {
-          // No model yet: fail open to escalation rather than stalling the
-          // agent loop behind a multi-hundred-MB download.
+          // No model: report it as such so the orchestrator falls back to the
+          // local planner instead of treating this as a real "escalate".
           post({
             type: 'DECISION',
             id: req.id,
-            decision: { action: { action: 'escalate', reason: 'local model not initialised' }, confidence: 0, source: 'local' },
+            decision: {
+              action: { action: 'escalate', reason: 'local model not initialised' },
+              confidence: 0,
+              source: 'local',
+            },
             raw: '',
           });
           req.frame.close();

@@ -7,6 +7,8 @@ export interface Settings {
   modelKey: string;
   /** Master switch: when false the agent never escalates, even on failure. */
   allowEscalation: boolean;
+  /** Download and initialise the local model without waiting for a click. */
+  autoLoadModel: boolean;
   redactionStyle: 'black' | 'blur' | 'pixelate';
   maxSteps: number;
   /** Local-only identity used to hydrate server value tokens. */
@@ -23,6 +25,7 @@ export const DEFAULT_SETTINGS: Settings = {
   confidenceThreshold: DEFAULTS.confidenceThreshold,
   modelKey: DEFAULT_MODEL_KEY,
   allowEscalation: true,
+  autoLoadModel: true,
   redactionStyle: 'black',
   maxSteps: 12,
   profile: {},

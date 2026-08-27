@@ -126,6 +126,7 @@ async function planWithOllama(req: InferenceRequestPayload, started: number): Pr
     stream: false,
     options: {
       temperature: 0,
+      num_ctx: Number(process.env.OLLAMA_NUM_CTX ?? 32768),
     },
   };
 
@@ -246,7 +247,7 @@ export function userPrompt(req: InferenceRequestPayload): string {
     `LOCAL MODEL GAVE UP: confidence=${req.localConfidence ?? 'n/a'} reason=${req.localReason ?? 'n/a'}`,
     req.history?.length ? `HISTORY: ${req.history.map((h) => h.action).join(' -> ')}` : '',
     'ELEMENTS:',
-    ...dom.nodes.map(
+    ...dom.nodes.slice(0, 80).map(
       (n) =>
         `[${n.id}] <${n.tag}${n.type ? ` type=${n.type}` : ''}>` +
         `${n.label ? ` label="${n.label}"` : ''}${n.text ? ` text="${n.text}"` : ''}` +

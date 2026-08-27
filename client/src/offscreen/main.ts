@@ -6,6 +6,7 @@
  * base64 data URLs and are decoded locally before transfer to the worker.
  */
 import type { WorkerRequest, WorkerResponse } from '~/ai/vlm-worker';
+import { dataUrlToBitmap } from '~/privacy/canvas-redactor';
 import { newId, type AgentAction, type AgentDecision, type ScrubbedDom } from '@shared/types';
 
 const worker = new Worker(new URL('../ai/vlm-worker.ts', import.meta.url), { type: 'module' });
@@ -13,10 +14,55 @@ const worker = new Worker(new URL('../ai/vlm-worker.ts', import.meta.url), { typ
 type Waiter = { resolve: (r: WorkerResponse) => void; reject: (e: Error) => void; want: WorkerResponse['type'] };
 const waiters = new Map<string, Waiter>();
 
+/**
+ * Per-file download progress, aggregated.
+ *
+ * `progress_callback` fires per ONNX graph (embed_tokens, vision_encoder,
+ * decoder_model_merged) with a 0-100 value for that file alone, so forwarding
+ * it raw made the popup's percentage jump backwards. Averaging by bytes gives
+ * one number that only moves forward.
+ */
+const fileProgress = new Map<string, { loaded: number; total: number }>();
+let lastPosted = -1;
+
+function forwardProgress(msg: Extract<WorkerResponse, { type: 'PROGRESS' }> & { loaded?: number; total?: number }): void {
+  if (msg.file && typeof msg.total === 'number' && msg.total > 0) {
+    fileProgress.set(msg.file, { loaded: msg.loaded ?? 0, total: msg.total });
+  }
+
+  let percent: number | undefined;
+  if (fileProgress.size > 0) {
+    let loaded = 0;
+    let total = 0;
+    for (const f of fileProgress.values()) {
+      loaded += f.loaded;
+      total += f.total;
+    }
+    if (total > 0) percent = Math.min(100, Math.round((loaded / total) * 100));
+  } else if (typeof msg.progress === 'number') {
+    percent = Math.round(msg.progress);
+  }
+
+  // Throttle: these fire hundreds of times per file.
+  if (percent !== undefined && percent === lastPosted && msg.status === 'progress') return;
+  if (percent !== undefined) lastPosted = percent;
+
+  const stage =
+    msg.status === 'progress' || msg.status === 'download'
+      ? `downloading weights${percent !== undefined ? ` ${percent}%` : ''}`
+      : msg.status === 'done'
+        ? 'preparing sessions'
+        : msg.status;
+
+  void chrome.runtime
+    .sendMessage({ target: 'background', kind: 'MODEL_PROGRESS', status: stage, progress: percent })
+    .catch(() => {});
+}
+
 worker.addEventListener('message', (ev: MessageEvent<WorkerResponse>) => {
   const msg = ev.data;
   if (msg.type === 'PROGRESS') {
-    void chrome.runtime.sendMessage({ target: 'background', kind: 'MODEL_PROGRESS', ...msg }).catch(() => {});
+    forwardProgress(msg);
     return;
   }
   const w = waiters.get(msg.id);
@@ -82,7 +128,7 @@ chrome.runtime.onMessage.addListener((message: OffscreenInferRequest, _sender, s
         }
         case 'INFER': {
           if (!message.frameDataUrl || !message.dom || !message.goal) throw new Error('INFER missing fields');
-          const bitmap = await createImageBitmap(await (await fetch(message.frameDataUrl)).blob());
+          const bitmap = await dataUrlToBitmap(message.frameDataUrl);
           const r = await ask(
             {
               type: 'INFER',
@@ -94,7 +140,9 @@ chrome.runtime.onMessage.addListener((message: OffscreenInferRequest, _sender, s
             },
             'DECISION',
             [bitmap],
-            45_000,
+            // The first inference also compiles WebGPU shaders, which can take
+            // far longer than steady-state generation.
+            90_000,
           );
           sendResponse({ ok: true, decision: r.decision satisfies AgentDecision, raw: r.raw });
           return;

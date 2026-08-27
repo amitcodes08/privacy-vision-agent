@@ -16,11 +16,19 @@ export default defineConfig({
   // pre-bundler so the .wasm/.mjs assets are emitted verbatim.
   optimizeDeps: { exclude: ['@huggingface/transformers', 'onnxruntime-web'] },
   worker: { format: 'es' },
+  server: {
+    port: 5173,
+    strictPort: true,
+    hmr: {
+      port: 5173,
+    },
+  },
   build: {
     target: 'esnext',
     sourcemap: true,
     rollupOptions: {
       input: {
+        popup: resolve(__dirname, 'src/popup/index.html'),
         offscreen: resolve(__dirname, 'src/offscreen/index.html'),
       },
     },

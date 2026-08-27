@@ -252,14 +252,14 @@ export type AnyMessage = ClientMessage | ServerMessage;
  * ------------------------------------------------------------------ */
 
 export const DEFAULTS = {
-  wsUrl: 'ws://localhost:8080',
+  wsUrl: 'ws://127.0.0.1:8080',
   confidenceThreshold: 0.62,
   heartbeatIntervalMs: 20_000,
   /** Hard cap so a rogue frame can't wedge the socket. */
   maxPayloadBytes: 6 * 1024 * 1024,
   jpegQuality: 0.72,
-  maxFrameWidth: 1280,
-  maxDomNodes: 220,
+  maxFrameWidth: 1024,
+  maxDomNodes: 120,
 } as const;
 
 const ACTION_KINDS: readonly ActionKind[] = [
@@ -343,13 +343,23 @@ export interface AgentStatus {
   running: boolean;
   goal?: string;
   step: number;
+  maxSteps?: number;
   wsConnected: boolean;
   webgpuAvailable: boolean;
   localModelReady: boolean;
   localModelId?: string;
+  /** True while weights are downloading / sessions are being created. */
+  modelLoading: boolean;
+  /** 0..100 download progress, when known. */
+  modelProgress?: number;
+  /** Human-readable load stage, e.g. "loading SmolVLM 256M on webgpu". */
+  modelStage?: string;
   lastDecision?: AgentDecision;
+  lastError?: string;
   escalations: number;
   localDecisions: number;
+  /** Actions decided by the on-device deterministic planner (no network). */
+  heuristicDecisions: number;
   redactions: number;
 }
 

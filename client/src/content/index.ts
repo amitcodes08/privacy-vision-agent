@@ -15,6 +15,10 @@ let lastIndex = new Map<string, Element>();
 chrome.runtime.onMessage.addListener((msg: { kind?: string; action?: AgentAction }, _sender, sendResponse) => {
   void (async () => {
     try {
+      if (msg?.kind === 'PING') {
+        sendResponse({ ok: true });
+        return;
+      }
       if (msg?.kind === 'SCRAPE') {
         const { dom, sensitiveBoxes, index } = buildScrubbedDom(document);
         lastIndex = index;
@@ -42,9 +46,18 @@ chrome.runtime.onMessage.addListener((msg: { kind?: string; action?: AgentAction
 function resolve(selector: string): HTMLElement {
   const cached = lastIndex.get(selector);
   if (cached?.isConnected) return cached as HTMLElement;
-  const el = document.querySelector<HTMLElement>(selector);
-  if (!el) throw new Error(`selector not found: ${selector}`);
-  return el;
+  try {
+    const el = document.querySelector<HTMLElement>(selector);
+    if (el) return el;
+  } catch {
+    // ignore querySelector syntax issues and try ID fallback
+  }
+  if (selector.startsWith('#')) {
+    const rawId = selector.slice(1).replace(/\\/g, '').trim();
+    const byId = document.getElementById(rawId);
+    if (byId) return byId;
+  }
+  throw new Error(`selector not found: ${selector}`);
 }
 
 async function perform(action: AgentAction): Promise<string> {

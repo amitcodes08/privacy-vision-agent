@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from 'react';
-import { Cpu, Eye, Play, Radio, Shield, Square } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { ChevronDown, Cpu, Play, Server, Settings2, ShieldCheck, Square, Terminal } from 'lucide-react';
 import type { AgentLogEntry, AgentStatus } from '@shared/types';
 import { loadSettings, saveSettings, type Settings } from '~/lib/settings';
 
@@ -18,6 +18,8 @@ export default function App() {
   const [logs, setLogs] = useState<AgentLogEntry[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [busy, setBusy] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [openPanel, setOpenPanel] = useState<'none' | 'settings' | 'activity'>('none');
 
   const refresh = useCallback(async () => {
     const reply = await send<StatusReply>({ kind: 'AGENT_STATUS_REQUEST' }).catch(() => null);
@@ -34,70 +36,146 @@ export default function App() {
 
   const patch = async (p: Partial<Settings>) => setSettings(await saveSettings(p));
 
+  const running = status?.running ?? false;
+
   const start = async () => {
-    if (!goal.trim()) return;
+    setErrorMsg(null);
+    if (!goal.trim()) {
+      setErrorMsg('Type what the agent should do on this tab.');
+      return;
+    }
     setBusy(true);
-    await send({ kind: 'AGENT_START', goal: goal.trim() }).catch(() => null);
-    setBusy(false);
-    void refresh();
+    try {
+      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const res = await send<{ ok: boolean; error?: string }>({
+        kind: 'AGENT_START',
+        goal: goal.trim(),
+        tabId: activeTab?.id,
+      });
+      if (!res?.ok && res?.error) setErrorMsg(res.error);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+      void refresh();
+    }
   };
 
-  const running = status?.running ?? false;
+  /** One line that says where decisions are coming from. */
+  const engine = useMemo(() => {
+    if (!status) return { label: 'starting…', tone: 'idle' as const };
+    if (status.modelLoading) {
+      const pct = status.modelProgress;
+      return { label: pct !== undefined ? `loading model ${pct}%` : (status.modelStage ?? 'loading model'), tone: 'busy' as const };
+    }
+    if (status.localModelReady) {
+      return { label: status.webgpuAvailable ? 'on-device · WebGPU' : 'on-device · CPU', tone: 'ok' as const };
+    }
+    return { label: 'on-device planner', tone: 'warn' as const };
+  }, [status]);
+
+  const problem = errorMsg ?? status?.lastError;
+  const acted = (status?.localDecisions ?? 0) + (status?.heuristicDecisions ?? 0);
+  const escalated = status?.escalations ?? 0;
+  const hasRun = acted + escalated > 0;
 
   return (
     <div className="wrap">
       <header>
-        <Shield size={16} color="#7c3aed" />
+        <ShieldCheck size={15} className="brand" />
         <h1>Privacy Vision Agent</h1>
-        <span className="spacer" />
-        <span className={`pill ${status?.webgpuAvailable ? 'on' : 'warn'}`} title="WebGPU adapter">
-          <Cpu size={11} /> {status?.webgpuAvailable ? 'WebGPU' : 'no GPU'}
-        </span>
-        <span className={`pill ${status?.wsConnected ? 'on' : 'off'}`} title="Escalation channel">
-          <Radio size={11} /> {status?.wsConnected ? 'ws' : 'local'}
-        </span>
       </header>
 
-      <div className="panel">
-        <label htmlFor="goal">Goal for this tab</label>
+      <div className="field">
         <textarea
           id="goal"
           value={goal}
-          placeholder="e.g. accept cookies, then open the billing settings page"
+          placeholder="What should the agent do on this tab?"
+          rows={2}
           onChange={(e) => setGoal(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) void start();
+          }}
         />
-        <div className="row" style={{ marginTop: 8 }}>
-          <button onClick={running ? () => void send({ kind: 'AGENT_STOP' }) : start} disabled={busy}>
-            {running ? <Square size={13} /> : <Play size={13} />}
-            {running ? 'Stop' : 'Run agent'}
-          </button>
-          <button className="ghost" onClick={() => void send({ kind: 'WARM_UP' }).then(refresh)}>
-            <Eye size={13} /> {status?.localModelReady ? 'Model loaded' : 'Load local model'}
-          </button>
-        </div>
-        {status?.localModelId && <div className="muted" style={{ marginTop: 6 }}>{status.localModelId}</div>}
+        <button
+          className="primary"
+          onClick={running ? () => void send({ kind: 'AGENT_STOP' }) : start}
+          disabled={busy}
+        >
+          {running ? <Square size={13} /> : <Play size={13} />}
+          {running ? `Stop · ${status?.step ?? 0}/${status?.maxSteps ?? '?'}` : 'Run'}
+        </button>
       </div>
 
-      <div className="stats">
-        <div className="stat">
-          <b>{status?.localDecisions ?? 0}</b>
-          <span>local acts</span>
-        </div>
-        <div className="stat">
-          <b>{status?.escalations ?? 0}</b>
-          <span>escalations</span>
-        </div>
-        <div className="stat">
-          <b>{status?.redactions ?? 0}</b>
-          <span>redactions</span>
-        </div>
+      <div className="engine" data-tone={engine.tone}>
+        <Cpu size={12} />
+        <span>{engine.label}</span>
+        {status?.modelLoading && status.modelProgress !== undefined && (
+          <i className="bar" style={{ ['--p' as string]: `${status.modelProgress}%` }} />
+        )}
+        {hasRun && (
+          <span className="tally" title="Actions decided on-device vs escalated to the server">
+            {acted} local
+            {escalated > 0 && (
+              <>
+                {' · '}
+                <em>
+                  <Server size={10} /> {escalated}
+                </em>
+              </>
+            )}
+          </span>
+        )}
       </div>
 
-      {settings && (
+      {problem && <div className="alert">{problem}</div>}
+
+      <div className="disclosures">
+        <button
+          className={`disclosure ${openPanel === 'settings' ? 'open' : ''}`}
+          onClick={() => setOpenPanel(openPanel === 'settings' ? 'none' : 'settings')}
+        >
+          <Settings2 size={12} /> Settings <ChevronDown size={12} className="chev" />
+        </button>
+        <button
+          className={`disclosure ${openPanel === 'activity' ? 'open' : ''}`}
+          onClick={() => setOpenPanel(openPanel === 'activity' ? 'none' : 'activity')}
+        >
+          <Terminal size={12} /> Activity <ChevronDown size={12} className="chev" />
+        </button>
+      </div>
+
+      {openPanel === 'settings' && settings && (
         <div className="panel">
-          <div className="row">
-            <div style={{ flex: 1 }}>
-              <label htmlFor="thr">Escalation threshold ({settings.confidenceThreshold.toFixed(2)})</label>
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={settings.allowEscalation}
+              onChange={(e) => void patch({ allowEscalation: e.target.checked })}
+            />
+            <span>
+              Allow redacted cloud escalation
+              <small>Only when nothing on-device is confident. Frames are redacted first.</small>
+            </span>
+          </label>
+
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={settings.autoLoadModel}
+              onChange={(e) => void patch({ autoLoadModel: e.target.checked })}
+            />
+            <span>
+              Load the local model automatically
+              <small>~230 MB on first run, then cached by the browser.</small>
+            </span>
+          </label>
+
+          <div className="grid2">
+            <div>
+              <label htmlFor="thr">
+                Confidence threshold <b>{settings.confidenceThreshold.toFixed(2)}</b>
+              </label>
               <input
                 id="thr"
                 type="range"
@@ -106,10 +184,9 @@ export default function App() {
                 step={0.01}
                 value={settings.confidenceThreshold}
                 onChange={(e) => void patch({ confidenceThreshold: Number(e.target.value) })}
-                style={{ width: '100%' }}
               />
             </div>
-            <div style={{ width: 110 }}>
+            <div>
               <label htmlFor="style">Redaction</label>
               <select
                 id="style"
@@ -122,32 +199,42 @@ export default function App() {
               </select>
             </div>
           </div>
-          <label style={{ marginTop: 8 }}>
+
+          <div>
+            <label htmlFor="email">Profile email <small>stays on this device</small></label>
             <input
-              type="checkbox"
-              checked={settings.allowEscalation}
-              onChange={(e) => void patch({ allowEscalation: e.target.checked })}
-            />{' '}
-            Allow redacted cloud escalation
-          </label>
-          <label htmlFor="email" style={{ marginTop: 8 }}>Local profile — email (never sent to server)</label>
-          <input
-            id="email"
-            type="email"
-            value={settings.profile.email ?? ''}
-            onChange={(e) => void patch({ profile: { ...settings.profile, email: e.target.value } })}
-          />
+              id="email"
+              type="email"
+              placeholder="you@example.com"
+              value={settings.profile.email ?? ''}
+              onChange={(e) => void patch({ profile: { ...settings.profile, email: e.target.value } })}
+            />
+          </div>
+
+          {!status?.localModelReady && !status?.modelLoading && (
+            <button className="ghost wide" onClick={() => void send({ kind: 'WARM_UP' }).then(refresh)}>
+              Load local model now
+            </button>
+          )}
+          {status?.localModelId && <div className="meta">{status.localModelId}</div>}
         </div>
       )}
 
-      <div className="panel log">
-        {logs.length === 0 && <div>no activity yet</div>}
-        {logs.map((l, i) => (
-          <div key={`${l.ts}-${i}`} className={l.level}>
-            {new Date(l.ts).toLocaleTimeString()} [{l.scope}] {l.message}
-          </div>
-        ))}
-      </div>
+      {openPanel === 'activity' && (
+        <div className="panel log">
+          {logs.length === 0 && <div className="meta">No activity yet.</div>}
+          {logs
+            .slice()
+            .reverse()
+            .map((l, i) => (
+              <div key={`${l.ts}-${i}`} className={l.level}>
+                <span className="t">{new Date(l.ts).toLocaleTimeString()}</span>
+                <span className="s">{l.scope}</span>
+                {l.message}
+              </div>
+            ))}
+        </div>
+      )}
     </div>
   );
 }

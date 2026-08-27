@@ -117,10 +117,59 @@ function paint(
   ctx.imageSmoothingEnabled = true;
 }
 
-/** Decode a `chrome.tabs.captureVisibleTab` data URL without touching the DOM. */
+/** Convert data URL to Blob without fetch (which is unsupported on data: in MV3 service workers). */
+export function dataUrlToBlob(dataUrl: string): Blob {
+  const comma = dataUrl.indexOf(',');
+  const header = comma >= 0 ? dataUrl.slice(0, comma) : '';
+  const base64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
+  const mimeMatch = header.match(/:(.*?);/);
+  const mime = mimeMatch ? mimeMatch[1] : 'image/png';
+  const binary = atob(base64);
+  const len = binary.length;
+  const buffer = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    buffer[i] = binary.charCodeAt(i);
+  }
+  return new Blob([buffer], { type: mime });
+}
+
+/** Decode a `chrome.tabs.captureVisibleTab` data URL without touching the DOM or network stack. */
 export async function dataUrlToBitmap(dataUrl: string): Promise<ImageBitmap> {
-  const res = await fetch(dataUrl);
-  return createImageBitmap(await res.blob());
+  const blob = dataUrlToBlob(dataUrl);
+  return createImageBitmap(blob);
+}
+
+/**
+ * Shrink + re-encode a capture before it is handed to the local model.
+ *
+ * `captureVisibleTab` returns a PNG at devicePixelRatio, which on a HiDPI
+ * display is several megabytes of base64. That string has to cross
+ * `chrome.runtime.sendMessage` to the offscreen document, be decoded, and then
+ * be resampled again by the image processor — slow enough to blow the worker's
+ * inference timeout. One downscale here fixes all three costs.
+ *
+ * This stays unredacted on purpose: it feeds the on-device model only. The
+ * escalation path uses `redactFrame` instead.
+ */
+export async function downscaleFrame(
+  dataUrl: string,
+  maxWidth = DEFAULTS.maxFrameWidth,
+  quality = 0.85,
+): Promise<{ dataUrl: string; width: number; height: number }> {
+  const bitmap = await dataUrlToBitmap(dataUrl);
+  try {
+    const scale = Math.min(1, maxWidth / Math.max(1, bitmap.width));
+    const w = Math.max(1, Math.round(bitmap.width * scale));
+    const h = Math.max(1, Math.round(bitmap.height * scale));
+    const canvas = new OffscreenCanvas(w, h);
+    const ctx = canvas.getContext('2d', { alpha: false });
+    if (!ctx) return { dataUrl, width: bitmap.width, height: bitmap.height };
+    ctx.drawImage(bitmap, 0, 0, w, h);
+    const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality });
+    return { dataUrl: `data:image/jpeg;base64,${await blobToBase64(blob)}`, width: w, height: h };
+  } finally {
+    bitmap.close();
+  }
 }
 
 export async function blobToBase64(blob: Blob): Promise<string> {

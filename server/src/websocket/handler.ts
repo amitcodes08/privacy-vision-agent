@@ -124,7 +124,7 @@ async function handleInference(
   stats.requests++;
   const started = Date.now();
   try {
-    const result = await withTimeout(planAction(payload), LATENCY_BUDGET_MS * 4);
+    const result = await withTimeout(planAction(payload), Math.max(LATENCY_BUDGET_MS * 4, 90_000));
     const elapsed = Date.now() - started;
     latencies.push(elapsed);
     if (latencies.length > 500) latencies.shift();

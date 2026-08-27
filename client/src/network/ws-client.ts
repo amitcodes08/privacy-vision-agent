@@ -100,8 +100,8 @@ export class WsClient {
     return new Promise<InferenceResponsePayload>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(msg.id);
-        reject(new Error('escalation timed out'));
-      }, timeoutMs ?? this.opts.requestTimeoutMs ?? 8_000);
+        reject(new Error('escalation timed out (model generation took >60s)'));
+      }, timeoutMs ?? this.opts.requestTimeoutMs ?? 60_000);
       this.pending.set(msg.id, { resolve, reject, timer });
       this.ws!.send(raw);
     });

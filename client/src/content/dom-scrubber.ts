@@ -59,11 +59,22 @@ export function isValueForbidden(reasons: RedactionReason[]): boolean {
 
 /** Stable, reasonably short selector the client can resolve later. */
 export function cssPath(el: Element, doc: Document = el.ownerDocument!): string {
-  if (el.id && doc.querySelectorAll(cssEscape(`#${el.id}`)).length === 1) return `#${cssIdent(el.id)}`;
+  if (el.id) {
+    const idSel = `#${escapeIdent(el.id)}`;
+    try {
+      if (doc.querySelectorAll(idSel).length === 1) return idSel;
+    } catch {
+      // ignore invalid selector syntax
+    }
+  }
   const name = el.getAttribute('name');
   if (name) {
     const candidate = `${el.tagName.toLowerCase()}[name="${cssAttr(name)}"]`;
-    if (doc.querySelectorAll(candidate).length === 1) return candidate;
+    try {
+      if (doc.querySelectorAll(candidate).length === 1) return candidate;
+    } catch {
+      // ignore invalid selector syntax
+    }
   }
   const parts: string[] = [];
   let node: Element | null = el;
@@ -77,18 +88,33 @@ export function cssPath(el: Element, doc: Document = el.ownerDocument!): string 
     const sameTag = [...parent.children].filter((c) => c.tagName === node!.tagName);
     if (sameTag.length > 1) part += `:nth-of-type(${sameTag.indexOf(node) + 1})`;
     parts.unshift(part);
-    if (node.id && doc.querySelectorAll(`#${cssIdent(node.id)}`).length === 1) {
-      parts[0] = `#${cssIdent(node.id)}`;
-      break;
+    if (node.id) {
+      const idSel = `#${escapeIdent(node.id)}`;
+      try {
+        if (doc.querySelectorAll(idSel).length === 1) {
+          parts[0] = idSel;
+          break;
+        }
+      } catch {
+        // ignore invalid selector syntax
+      }
     }
     node = parent;
   }
   return parts.join(' > ');
 }
 
-const cssIdent = (s: string) => s.replace(/([^\w-])/g, '\\$1');
+export const escapeIdent = (s: string): string => {
+  if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
+    return CSS.escape(s);
+  }
+  if (/^[0-9]/.test(s)) {
+    return `\\3${s[0]} ${s.slice(1).replace(/([^\w-])/g, '\\$1')}`;
+  }
+  return s.replace(/([^\w-])/g, '\\$1');
+};
+
 const cssAttr = (s: string) => s.replace(/["\\]/g, '\\$&');
-const cssEscape = (s: string) => s.replace(/([^\w\-#.[\]="'\\])/g, '\\$1');
 
 function labelFor(el: Element): string | undefined {
   const aria = el.getAttribute('aria-label');

@@ -1,16 +1,21 @@
 # Privacy Vision Agent
 
 A client-dominant hybrid vision agent. A quantized VLM runs **inside the
-browser on WebGPU** and acts on the page with zero network calls. Only when
-the local model is not confident enough does the extension escalate — and
-then it sends a **redacted** screenshot plus a **scrubbed** DOM to a
-WebSocket server, which returns a *structural* command whose private values
-are re-hydrated locally.
+browser on WebGPU** and acts on the page with zero network calls. When the
+local model is not confident enough, a deterministic **on-device planner**
+gets the next shot. Only when *both* on-device paths come up short does the
+extension escalate — and then it sends a **redacted** screenshot plus a
+**scrubbed** DOM to a WebSocket server, which returns a *structural* command
+whose private values are re-hydrated locally.
 
 ```
 content script ──scrubbed DOM + sensitive boxes──┐
                                                  ▼
-captureVisibleTab ──raw frame──► offscreen ► WebGPU worker ► action  (Path A: local, no network)
+captureVisibleTab ──raw frame──► offscreen ► WebGPU worker ──► action   (1: local VLM)
+                                    │
+                        confidence < threshold
+                                    ▼
+                       on-device keyword planner ──► action            (2: local, still no network)
                                     │
                         confidence < threshold
                                     ▼
@@ -18,8 +23,12 @@ captureVisibleTab ──raw frame──► offscreen ► WebGPU worker ► actio
                                     ▼
                      ws://localhost:8080 ► cloud VLM
                                     ▼
-                 {action, selector, valueType} ► local hydration ► action  (Path B)
+                 {action, selector, valueType} ► local hydration ► action  (3: last resort)
 ```
+
+Tier 2 is what keeps the server idle. Without it, "the local model is unsure"
+meant "upload a frame", so a small VLM having a bad day turned into a network
+round trip on every single step.
 
 ## Layout
 
@@ -29,9 +38,13 @@ captureVisibleTab ──raw frame──► offscreen ► WebGPU worker ► actio
 | [client/src/content/dom-scrubber.ts](client/src/content/dom-scrubber.ts) | Page → `ScrubbedDom` + boxes to black out |
 | [client/src/privacy/pii-detector.ts](client/src/privacy/pii-detector.ts) | Luhn/Verhoeff-checked PII rules, deterministic |
 | [client/src/privacy/canvas-redactor.ts](client/src/privacy/canvas-redactor.ts) | Destructive box painting → JPEG base64 |
-| [client/src/ai/vlm-worker.ts](client/src/ai/vlm-worker.ts) | Transformers.js v3 on WebGPU, in a worker |
+| [client/src/ai/models.ts](client/src/ai/models.ts) | Model catalogue + **per-graph** quantization |
+| [client/src/ai/model-loader.ts](client/src/ai/model-loader.ts) | Transformers.js v3 load + generate |
+| [client/src/ai/decision-parser.ts](client/src/ai/decision-parser.ts) | Model text → action, with selector repair + confidence |
+| [client/src/ai/local-planner.ts](client/src/ai/local-planner.ts) | Tier 2: deterministic on-device planner, no model, no network |
+| [client/src/ai/vlm-worker.ts](client/src/ai/vlm-worker.ts) | Worker that owns the WebGPU context and weights |
 | [client/src/offscreen/main.ts](client/src/offscreen/main.ts) | Offscreen host — the SW cannot own a GPU context |
-| [client/src/background/index.ts](client/src/background/index.ts) | Orchestrator: the escalation gate lives here |
+| [client/src/background/index.ts](client/src/background/index.ts) | Orchestrator: the escalation ladder lives here |
 | [client/src/content/value-hydrator.ts](client/src/content/value-hydrator.ts) | Resolves `USER_EMAIL` etc. from local storage |
 | [server/src/websocket/handler.ts](server/src/websocket/handler.ts) | Envelope validation, rate limit, latency budget |
 | [server/src/ai/cloud-vlm.ts](server/src/ai/cloud-vlm.ts) | Local Ollama / Gemini adapter + offline heuristic planner |
@@ -53,8 +66,10 @@ ollama run llama3.2-vision
 ```
 
 Then load `client/dist` via `chrome://extensions` → *Load unpacked*. Open the
-popup, click **Load local model** (first run downloads ~230 MB of weights
-from the Hub into the browser cache), type a goal, and hit **Run agent**.
+popup, type a goal, and hit **Run**. The local model starts downloading on
+install (~230 MB of weights, cached by the browser afterwards); the popup's
+status strip shows progress, and the on-device planner can already act while
+it downloads. Auto-loading is a setting if you would rather click to load.
 
 If Ollama is offline or no model is configured, the server gracefully falls back to
 its deterministic keyword planner so the entire loop is always demoable offline:
@@ -63,11 +78,36 @@ its deterministic keyword planner so the entire loop is always demoable offline:
 npm run smoke --workspace server   # CONNECT + INFERENCE_REQUEST round trip
 ```
 
+## Local inference, and what it took to make it actually run
+
+Three things had to be right before the on-device model produced a usable
+action rather than silently deferring to the server:
+
+- **Quantization is per ONNX graph, not per model.** SmolVLM ships as
+  `embed_tokens` + `vision_encoder` + `decoder_model_merged`. A flat
+  `dtype: 'q4'` also 4-bit-quantizes the *embedding table*, and the decoder
+  then emits fluent-looking garbage that never parses. `embed_tokens` stays
+  fp16 (fp32 without `shader-f16`); the other two graphs take q4.
+- **`AutoModelForImageTextToText`, not `AutoModelForVision2Seq`.** These are
+  three-graph image-text-to-text models. Vision2Seq looks for an
+  `encoder_model` the repos do not ship, and Qwen2-VL is not registered under
+  it at all.
+- **Decode only the generated tokens.** `generate()` returns prompt +
+  completion. Cutting the prompt back off by string matching was unreliable,
+  and on failure the JSON extractor latched onto the schema example *inside
+  the prompt* — which parses, but is not a valid action. Slicing by
+  `input_ids` length removes the failure mode.
+
+The prompt asks the model for a numeric element **id** rather than a CSS
+selector, and [decision-parser.ts](client/src/ai/decision-parser.ts) resolves
+ids, exact selectors, `name` attributes, and labels back to a real element
+before scoring. Recovering a near-miss is one escalation that does not happen.
+
 ## Verification status
 
 ```
-client: 22 passed, 2 skipped   (vitest, jsdom)
-server:  6 passed              (vitest)
+client: 50 passed, 2 skipped   (vitest, jsdom)
+server:  8 passed              (vitest)
 tsc --noEmit: clean in both workspaces
 vite build:   extension bundles (transformers/onnxruntime isolated to the worker chunk)
 smoke:        WS round trip 4-5 ms against the heuristic planner
@@ -83,6 +123,9 @@ need a manual pass.
 
 - The unredacted frame reaches exactly one consumer: the offscreen WebGPU
   worker. `background/index.ts` hands `WsClient` only `redactFrame()` output.
+  The downscale in `downscaleFrame()` also stays on the local path.
+- Tier 2 is a pure function of the already-scrubbed DOM, so the cheapest
+  fallback is also the most private one.
 - Sensitive field values are replaced before serialization, not after:
   `dom-scrubber.ts` never copies a password, card, CVV, or OTP value into the
   payload; free text is run through `redactText()`.
@@ -98,9 +141,12 @@ need a manual pass.
   reason. Add a shared-secret handshake before exposing it off-host.
 - Visual PII redaction is DOM-driven. Faces and PII baked into images are not
   detected yet; the `pii-detector` seam is where a local face detector goes.
-- `parseAction` scores confidence structurally (does the selector exist?)
+- Confidence is scored structurally (does the element resolve? is it enabled?)
   rather than from token logprobs. Wiring `output_scores` in would make the
   gate sharper.
+- The tier-2 planner is keyword- and synonym-driven. It handles consent
+  banners, logins, and search boxes well; it will not reason about multi-step
+  intent, which is exactly what tiers 1 and 3 are for.
 - `sharp` ships two high-severity libvips advisories as a transitive,
   Node-only dependency of `@huggingface/transformers`; it is not part of the
   extension bundle.
