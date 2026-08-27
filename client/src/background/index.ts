@@ -531,31 +531,37 @@ function repeatedTail(history: readonly AgentAction[]): number {
 async function applyDecision(
   tabId: number,
   decision: AgentDecision,
-  preDom: ScrubbedDom,
-): Promise<{ action: AgentAction; postDom: ScrubbedDom }> {
+  initialPreDom: ScrubbedDom,
+): Promise<{ action: AgentAction; preDom: ScrubbedDom; postDom: ScrubbedDom }> {
   status.lastDecision = decision;
   const action = decision.action;
   if (action.action === 'done' || action.action === 'escalate' || action.action === 'invalid') {
-    return { action, postDom: preDom };
+    return { action, preDom: initialPreDom, postDom: initialPreDom };
   }
+
+  // Fresh pre-execution snapshot taken immediately before executing action
+  // to avoid attributing any asynchronous updates that settled during model inference.
+  const immediatePre = await scrape(tabId);
+  const preDom = immediatePre.dom;
   
   const res = await execute(tabId, action);
   if (!res.ok) {
     logger.warn('execute', `${action.action} failed`, res.error);
-    return { action: { action: 'invalid', reason: res.error || 'execution failed' }, postDom: preDom };
+    return { action: { action: 'invalid', reason: res.error || 'execution failed' }, preDom, postDom: preDom };
   }
 
   // Adaptive settlement for state-changing actions
+  await sleep(100);
   let post = await scrape(tabId);
   if (action.action === 'click' || action.action === 'fill' || action.action === 'navigate') {
     if (fingerprint(preDom) === fingerprint(post.dom)) {
        // State unchanged immediately, give it a short time to settle
-       await sleep(400);
+       await sleep(350);
        post = await scrape(tabId);
     }
   }
 
-  return { action, postDom: post.dom };
+  return { action, preDom, postDom: post.dom };
 }
 
 
