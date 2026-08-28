@@ -963,58 +963,46 @@ export function buildScrubbedDom(
       }
     }
 
+    const rawContext = findContext(el);
+    if (rawContext) {
+      const { text: cleanContext, reasons: ctxReasons } = redactText(rawContext, REDACTED_PLACEHOLDER);
+      if (cleanContext && cleanContext !== ownText && cleanContext !== node.label) {
+        node.context = cleanContext.slice(0, 120);
+        if (ctxReasons.length > 0) {
+          ctxReasons.forEach(bump);
+          node.redacted = [...new Set([...(node.redacted ?? []), ...ctxReasons])];
+        }
+      }
+    }
+
     /* ------------------------------------------------------------ *
      * Form/control value scrubbing
      *
      * Use tag-name checks + casts instead of Window constructors.
      * ------------------------------------------------------------ */
 
-    const rawValue =
-      readValue(
-        el,
-      );
+    const rawValue = readValue(el);
 
-    if (
-      rawValue !== undefined
-    ) {
-      if (
-        isValueForbidden(
-          reasons,
-        )
-      ) {
-        node.value =
-          REDACTED_PLACEHOLDER;
-      } else if (
-        hasPii(rawValue)
-      ) {
-        const found =
-          detectPii(
-            rawValue,
-          ).map(
-            (match) =>
-              match.reason,
-          );
-
-        found.forEach(
-          bump,
-        );
-
-        node.value =
-          REDACTED_PLACEHOLDER;
-
+    if (rawValue !== undefined) {
+      if (isValueForbidden(reasons)) {
+        node.value = REDACTED_PLACEHOLDER;
+      } else if (hasPii(rawValue)) {
+        const found = detectPii(rawValue).map((match) => match.reason);
+        found.forEach(bump);
+        node.value = REDACTED_PLACEHOLDER;
         node.redacted = [
           ...new Set([
-            ...(node.redacted ??
-              []),
+            ...(node.redacted ?? []),
             ...found,
           ]),
         ];
-
         if (rect) {
-          sensitiveBoxes.push(
-            rect,
-          );
+          sensitiveBoxes.push(rect);
         }
+      } else {
+        node.value = squash(rawValue);
+      }
+    }
       } else {
         node.value =
           squash(
@@ -1142,6 +1130,74 @@ export function buildScrubbedDom(
     sensitiveBoxes,
     index,
   };
+}
+
+const CONTAINER_SELECTOR =
+  'article, [role="listitem"], [role="article"], li, tr, [data-testid*="product"], [data-testid*="item"], [data-testid*="card"], [class*="product"], [class*="card"], [class*="item"], [class*="result"], [class*="tile"], [class*="listing"], [class*="row"], fieldset, form, section';
+
+/**
+ * Finds semantic container context (e.g. product title, card header, table row context)
+ * so that identical action buttons like "Add to Cart" or "Select" can be disambiguated.
+ */
+function findContext(el: Element): string | undefined {
+  let container: Element | null = null;
+  let curr = el.parentElement;
+  let depth = 0;
+  while (curr && depth < 5) {
+    if (curr.matches && curr.matches(CONTAINER_SELECTOR)) {
+      container = curr;
+      break;
+    }
+    curr = curr.parentElement;
+    depth++;
+  }
+
+  if (!container && el.parentElement) {
+    const parent = el.parentElement;
+    if (parent.querySelector?.('h1, h2, h3, h4, h5, h6, [class*="title"], [class*="name"], [class*="header"]')) {
+      container = parent;
+    } else if (parent.parentElement?.querySelector?.('h1, h2, h3, h4, h5, h6, [class*="title"], [class*="name"]')) {
+      container = parent.parentElement;
+    }
+  }
+
+  if (!container) return undefined;
+
+  // 1. Try finding explicit title / heading elements in container
+  const titleEl = container.querySelector?.(
+    'h1, h2, h3, h4, h5, h6, [class*="title"], [class*="name"], [class*="heading"], [class*="header"], [data-testid*="title"], [data-testid*="name"]'
+  );
+  if (titleEl && titleEl !== el && !titleEl.contains(el)) {
+    const text = squash(titleEl.textContent ?? '');
+    if (text && text.length > 2) return text;
+  }
+
+  // 2. In table rows, look at first cell (th or td)
+  if (container.tagName === 'TR') {
+    const firstCell = container.querySelector?.('th, td');
+    if (firstCell && firstCell !== el && !firstCell.contains(el)) {
+      const text = squash(firstCell.textContent ?? '');
+      if (text && text.length > 2) return text;
+    }
+  }
+
+  // 3. Container aria-label or title attribute
+  const aria = container.getAttribute?.('aria-label') || container.getAttribute?.('title');
+  if (aria && aria.trim().length > 2) return squash(aria);
+
+  // 4. Extract non-interactive text summary inside the container
+  let summary = '';
+  for (const child of container.childNodes) {
+    if (child.nodeType === 3) summary += (child.nodeValue ?? '') + ' ';
+    else if (child.nodeType === 1 && child !== el && !(child as Element).contains(el) && !(child as Element).matches?.(INTERACTIVE)) {
+      summary += ((child as Element).textContent ?? '') + ' ';
+    }
+    if (summary.length > 120) break;
+  }
+  const cleanSummary = squash(summary);
+  if (cleanSummary && cleanSummary.length > 3) return cleanSummary;
+
+  return undefined;
 }
 
 /* ------------------------------------------------------------------ *

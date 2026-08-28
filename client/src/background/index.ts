@@ -33,7 +33,7 @@ import {
 } from '@shared/types';
 import { redactFrame, dataUrlToBitmap, downscaleFrame } from '~/privacy/canvas-redactor';
 import { WsClient } from '~/network/ws-client';
-import { planLocally } from '~/ai/local-planner';
+import { planLocally, tokenize } from '~/ai/local-planner';
 import { loadSettings, type Settings } from '~/lib/settings';
 import { logger, recentLogs } from '~/lib/log';
 import { checkTermination, corroborateDone, HIGH_CONFIDENCE } from '~/ai/termination-checker';
@@ -783,6 +783,48 @@ function advanceObjective(tm: TaskMemory, why: string): boolean {
   return false;
 }
 
+function isActionMatchingObjective(
+  objective: string,
+  action: AgentAction,
+  preDom: ScrubbedDom,
+): boolean {
+  if (action.action === 'invalid' || action.action === 'wait' || action.action === 'escalate') {
+    return false;
+  }
+
+  const objTokens = tokenize(objective);
+  if (objTokens.length === 0) return true;
+
+  if (action.action === 'click') {
+    const node = preDom.nodes.find((n) => n.selector === action.selector);
+    if (!node) return false;
+    const nodeHay = [node.label, node.text, node.context, node.placeholder, node.name, node.role, node.tag]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
+
+    const matches = objTokens.filter((t) => nodeHay.includes(t));
+    if (matches.length > 0) return true;
+    if (action.reason && objTokens.some((t) => action.reason!.toLowerCase().includes(t))) return true;
+  }
+
+  if (action.action === 'fill') {
+    const node = preDom.nodes.find((n) => n.selector === action.selector);
+    const nodeHay = [node?.label, node?.text, node?.context, node?.placeholder, node?.name, action.value]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
+    const matches = objTokens.filter((t) => nodeHay.includes(t));
+    if (matches.length > 0) return true;
+  }
+
+  if (action.action === 'navigate') {
+    return true;
+  }
+
+  return false;
+}
+
 /**
  * Did the active sub-objective just land?
  *
@@ -839,6 +881,10 @@ async function subObjectiveSatisfied(
       done: true,
       why: `nano: ${verdict.reason}`,
     };
+  }
+
+  if (isActionMatchingObjective(objective, action, result.preDom)) {
+    return { done: true, why: `action ${action.action} executed for objective "${objective}"` };
   }
 
   return {
@@ -1116,20 +1162,18 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
 
       taskMemory.lastAction = { action, result: resultCategory };
 
-      if (resultCategory === 'state_changed') {
-        taskMemory.attemptedTargets = [];
-
+      if (action.action !== 'invalid' && action.action !== 'wait' && action.action !== 'escalate') {
         if (taskMemory.subObjectives && taskMemory.subObjectives.length > 0) {
           const current = taskMemory.subObjectives[activeIndexOf(taskMemory)];
           if (current) {
             const verdict = await subObjectiveSatisfied(current.description, action, result, history);
-            if (verdict.done && !advanceObjective(taskMemory, verdict.why)) {
-              // That was the last sub-objective, so the plan is finished by its
-              // own definition. Continuing would hand the vision tier an
-              // undefined objective and the raw compound goal, which is the
-              // thing the decomposition existed to avoid.
-              history.push({ action: 'done', summary: `all sub-objectives complete (${verdict.why})` });
-              break;
+            if (verdict.done) {
+              if (!advanceObjective(taskMemory, verdict.why)) {
+                // That was the last sub-objective, so the plan is finished by its
+                // own definition.
+                history.push({ action: 'done', summary: `all sub-objectives complete (${verdict.why})` });
+                break;
+              }
             }
           }
         } else {
@@ -1140,6 +1184,10 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
             taskMemory.currentObjective = action.currentObjective;
           }
         }
+      }
+
+      if (resultCategory === 'state_changed') {
+        taskMemory.attemptedTargets = [];
       } else if (resultCategory === 'no_change' || resultCategory === 'failed') {
         if ('selector' in action && action.selector) {
           taskMemory.attemptedTargets.push(action.selector);

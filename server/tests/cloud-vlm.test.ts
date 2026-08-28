@@ -45,6 +45,18 @@ describe('heuristicPlan', () => {
     expect(decision.action.action).toBe('done');
     expect(decision.confidence).toBeLessThan(0.5);
   });
+
+  it('disambiguates between multiple identical buttons using context', () => {
+    const multiDom: ScrubbedDom = {
+      ...dom,
+      nodes: [
+        { id: 0, tag: 'button', selector: '#btn-15', text: 'Add to Cart', context: 'iPhone 15', visible: true },
+        { id: 1, tag: 'button', selector: '#btn-17', text: 'Add to Cart', context: 'iPhone 17 Pro Max', visible: true },
+      ],
+    };
+    const decision = heuristicPlan({ ...request('Add iPhone 17 to cart'), dom: multiDom });
+    expect(decision.action).toMatchObject({ action: 'click', selector: '#btn-17' });
+  });
 });
 
 describe('extractJson', () => {

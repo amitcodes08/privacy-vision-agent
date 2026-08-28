@@ -65,6 +65,8 @@ Rules:
   "value":"<only when valueType is LITERAL>","confidence":0..1,"reason":"<short>"}
 - Only use selectors that appear verbatim in ELEMENTS.
 - IMPORTANT: You must ONLY emit one of the allowed executable actions (click, fill, scroll, navigate, wait, done). NEVER emit semantic phrases like "add to cart" as the "action" field.
+- Disambiguation: When multiple elements have similar actions (e.g. multiple "Add to Cart", "Select", or "Buy" buttons for different products), you MUST match the specific item/product named in the GOAL or CURRENT OBJECTIVE by inspecting each element's context, label, or text. Choose only the ONE single element that corresponds to the requested item.
+- Single Execution: Once an action for the active objective/goal has already been performed or the goal is satisfied, emit "done" rather than clicking duplicate or additional item buttons.
 - If the goal requires interacting with a destination, prefer actionable state-changing elements (buttons) over navigation links.
 - Never invent or guess redacted content. Never emit passwords or OTP codes;
   the client refuses them.
@@ -275,6 +277,7 @@ export function userPrompt(req: InferenceRequestPayload): string {
       (n) =>
         `[${n.id}] <${n.tag}${n.type ? ` type=${n.type}` : ''}>` +
         `${n.label ? ` label="${n.label}"` : ''}${n.text ? ` text="${n.text}"` : ''}` +
+        `${n.context ? ` context="${n.context}"` : ''}` +
         `${n.value ? ` value="${n.value}"` : ''}${n.redacted?.length ? ` [redacted:${n.redacted.join(',')}]` : ''}` +
         ` selector=${n.selector}`,
     ),
@@ -296,29 +299,59 @@ export function sanitize(action: AgentAction): AgentAction {
   return action;
 }
 
+const STOPWORDS = new Set([
+  'the', 'and', 'for', 'with', 'this', 'that', 'then', 'from', 'into', 'your',
+  'you', 'please', 'can', 'could', 'would', 'want', 'need', 'get', 'got', 'let',
+  'its', 'his', 'her', 'their', 'has', 'have', 'was', 'were', 'are', 'but',
+  'not', 'all', 'any', 'out', 'off', 'now', 'page', 'site', 'website', 'button',
+  'link', 'field', 'box', 'first', 'next', 'also', 'again', 'more', 'see', 'down', 'up',
+  'click', 'clicks', 'clicking', 'press', 'tap', 'hit', 'push', 'type', 'paste',
+]);
+
 /**
  * Offline planner: enough signal to demo the loop end to end. Picks the
- * first element whose label/text overlaps the goal's keywords.
+ * element whose label/text/context best matches the goal's entity and action keywords.
  */
 export function heuristicPlan(req: InferenceRequestPayload): AgentDecision {
-  const words = req.goal.toLowerCase().match(/[a-z]{3,}/g) ?? [];
+  const targetText = req.taskMemory?.currentObjective || req.goal;
+  const rawWords = targetText.toLowerCase().match(/[a-z0-9]{2,}/g) ?? [];
+  const words = rawWords.filter((w) => !STOPWORDS.has(w));
+  const activeWords = words.length > 0 ? words : rawWords;
+
+  const attempted = new Set(req.taskMemory?.attemptedTargets ?? []);
+  for (const h of req.history ?? []) {
+    if ('selector' in h && h.selector) attempted.add(h.selector);
+  }
+
   const score = (n: ScrubbedDom['nodes'][number]) => {
-    const hay = `${n.label ?? ''} ${n.text ?? ''} ${n.placeholder ?? ''} ${n.name ?? ''}`.toLowerCase();
-    return words.reduce((acc, w) => acc + (hay.includes(w) ? w.length : 0), 0);
+    const hay = `${n.label ?? ''} ${n.text ?? ''} ${n.context ?? ''} ${n.placeholder ?? ''} ${n.name ?? ''}`.toLowerCase();
+    let s = 0;
+    for (const w of activeWords) {
+      if (hay.includes(w)) {
+        s += w.length >= 3 ? w.length * 2 : 2;
+        if (n.context && n.context.toLowerCase().includes(w)) {
+          s += 5; // Context disambiguation bonus
+        }
+      }
+    }
+    if (attempted.has(n.selector)) s -= 20; // Loop avoidance
+    return s;
   };
+
   const ranked = [...req.dom.nodes]
     .filter((n) => !n.disabled)
     .map((n) => ({ n, s: score(n) }))
     .sort((a, b) => b.s - a.s);
+
   const best = ranked[0];
-  if (!best || best.s === 0) {
+  if (!best || best.s <= 0) {
     return { action: { action: 'done', summary: 'no element matches the goal' }, confidence: 0.2, source: 'heuristic' };
   }
   const node = best.n;
   const fillable = node.tag === 'input' || node.tag === 'textarea';
   const action: AgentAction = fillable
     ? { action: 'fill', selector: node.selector, valueType: node.type === 'email' ? 'USER_EMAIL' : 'USER_FULL_NAME' }
-    : { action: 'click', selector: node.selector, reason: `keyword match on "${node.label ?? node.text ?? node.tag}"` };
+    : { action: 'click', selector: node.selector, reason: `keyword match on "${node.label ?? node.text ?? node.context ?? node.tag}"` };
   return { action, confidence: Math.min(0.75, 0.4 + best.s / 40), source: 'heuristic' };
 }
 

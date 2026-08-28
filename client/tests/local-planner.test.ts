@@ -225,4 +225,15 @@ describe('rankCandidates', () => {
     expect(rankOf(ranking, '#help')).toBeUndefined();
     expect(rankOf(ranking, '#pkg')).toBe(0);
   });
+
+  it('disambiguates identical action buttons using context', () => {
+    const products = dom([
+      node({ id: 0, selector: '#btn-15', text: 'Add to Cart', context: 'Apple iPhone 15 Pro 128GB' }),
+      node({ id: 1, selector: '#btn-16', text: 'Add to Cart', context: 'Apple iPhone 16 Pro 128GB' }),
+      node({ id: 2, selector: '#btn-17', text: 'Add to Cart', context: 'Apple iPhone 17 Pro 256GB' }),
+    ]);
+    const d = planLocally({ goal: 'Add iPhone 17 to cart', dom: products });
+    expect(d.action).toMatchObject({ action: 'click', selector: '#btn-17' });
+  });
 });
+

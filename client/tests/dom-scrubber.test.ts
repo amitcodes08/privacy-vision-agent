@@ -159,4 +159,23 @@ describe('buildScrubbedDom node budget', () => {
     const { dom, index } = buildScrubbedDom(document, 3);
     for (const n of dom.nodes) expect(index.get(n.selector)).toBe(document.querySelector(n.selector));
   });
+
+  it('extracts semantic container context for identical action buttons', () => {
+    document.body.innerHTML = `
+      <div class="product-card" id="c1">
+        <h3>iPhone 15</h3>
+        <button id="b1">Add to Cart</button>
+      </div>
+      <div class="product-card" id="c2">
+        <h3>iPhone 17 Pro</h3>
+        <button id="b2">Add to Cart</button>
+      </div>
+    `;
+    const { dom } = buildScrubbedDom(document);
+    const b1 = dom.nodes.find((n) => n.selector === '#b1');
+    const b2 = dom.nodes.find((n) => n.selector === '#b2');
+    expect(b1?.context).toContain('iPhone 15');
+    expect(b2?.context).toContain('iPhone 17 Pro');
+  });
 });
+

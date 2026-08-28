@@ -690,7 +690,7 @@ function kindOf(n: ScrubbedNode): Kind {
 }
 
 function haystack(n: ScrubbedNode): string {
-  return [n.label, n.text, n.placeholder, n.name, n.role, n.type, n.href?.split('/').slice(3).join(' ')]
+  return [n.label, n.text, n.context, n.placeholder, n.name, n.role, n.type, n.href?.split('/').slice(3).join(' ')]
     .filter(Boolean)
     .join(' ')
     .toLowerCase();
@@ -699,7 +699,7 @@ function haystack(n: ScrubbedNode): string {
 
 
 export function tokenize(goal: string): string[] {
-  return (goal.toLowerCase().match(/[a-z][a-z0-9-]{1,}/g) ?? []).filter((w) => w.length > 2 && !STOPWORDS.has(w));
+  return (goal.toLowerCase().match(/[a-z0-9][a-z0-9-]{0,}/g) ?? []).filter((w) => w.length >= 2 && !STOPWORDS.has(w));
 }
 
 /** Goal tokens plus their synonym groups, de-duplicated. */

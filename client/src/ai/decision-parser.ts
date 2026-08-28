@@ -77,9 +77,9 @@ export function buildPrompt(
         n.tag,
         n.type && `type=${n.type}`,
         n.role && `role=${n.role}`,
-        n.label && `label="${trunc(n.label)}"`,
-        n.text && `text="${trunc(n.text)}"`,
         n.placeholder && `placeholder="${trunc(n.placeholder)}"`,
+        n.context && `context="${trunc(n.context)}"`,
+        n.value && `value="${trunc(n.value)}"`,
       ]
         .filter(Boolean)
         .join(' ');

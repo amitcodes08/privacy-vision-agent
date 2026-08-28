@@ -191,6 +191,7 @@ export interface ScrubbedNode {
   label?: string;
   placeholder?: string;
   text?: string;
+  context?: string;
   value?: string;
   href?: string;
   checked?: boolean;
