@@ -355,11 +355,23 @@ function frameOnce(): () => Promise<string> {
  * inside the worker. It only *plans* on its own when there is no working model
  * to plan with, which is the one case where the alternative is nothing at all.
  */
+let activeAgentTabId: number | undefined;
+let pendingChildTabId: number | undefined;
+
+/**
+ * Run one perception -> decision -> action step.
+ *
+ * All three paths return this uniform record so `runAgent` can manage loop
+ * invariants (stagnation, termination checks, history) without special cases
+ * inside the worker. It only *plans* on its own when there is no working model
+ * to plan with, which is the one case where the alternative is nothing at all.
+ */
 interface StepResult {
   action: AgentAction;
   preDom: ScrubbedDom;
   postDom: ScrubbedDom;
   observed: boolean;
+  tabId?: number;
 }
 
 async function step(tabId: number, goal: string, history: AgentAction[], settings: Settings, taskMemory: TaskMemory): Promise<StepResult> {
@@ -402,7 +414,7 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
       if (corroborated.done && corroborated.confidence >= HIGH_CONFIDENCE) {
         logger.info('local', `vlm done corroborated by dom (${corroborated.reason}); stopping`);
         status.localDecisions++;
-        return { action: decision.action, preDom: dom, postDom: dom, observed: true };
+        return { action: decision.action, preDom: dom, postDom: dom, observed: true, tabId };
       }
       if (!corroborated.done) {
         // DOM contradicts — treat as if the VLM did not decide.
@@ -413,12 +425,12 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
         decision = null;
       } else {
         status.localDecisions++;
-        return { action: decision.action, preDom: dom, postDom: dom, observed: true };
+        return { action: decision.action, preDom: dom, postDom: dom, observed: true, tabId };
       }
     } else {
       status.localDecisions++;
       const applied = await applyDecision(tabId, decision, dom);
-      return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom, observed: applied.observed };
+      return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom, observed: applied.observed, tabId: applied.tabId };
     }
   }
 
@@ -434,7 +446,7 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
     if (planned.confidence >= Math.max(settings.confidenceThreshold, 0.60) && planned.action.action !== 'escalate') {
       status.heuristicDecisions++;
       const applied = await applyDecision(tabId, planned, dom);
-      return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom, observed: applied.observed };
+      return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom, observed: applied.observed, tabId: applied.tabId };
     }
   }
 
@@ -449,10 +461,10 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
       else status.localDecisions++;
       logger.info('escalate', `${escalationDown ? 'server unreachable' : 'disabled'}; acting on the best on-device decision`);
       const applied = await applyDecision(tabId, fallback, dom);
-      return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom, observed: applied.observed };
+      return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom, observed: applied.observed, tabId: applied.tabId };
     }
     logger.warn('escalate', 'unavailable and nothing actionable on-device; stopping');
-    return { action: { action: 'done', summary: 'low confidence and no escalation available' }, preDom: dom, postDom: dom, observed: true };
+    return { action: { action: 'done', summary: 'low confidence and no escalation available' }, preDom: dom, postDom: dom, observed: true, tabId };
   }
 
   const rawFrame = await frame();
@@ -487,7 +499,7 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
     const cloudDecision = sanitiseCloudAction(response.decision);
     logger.info('escalate', `cloud decision ${cloudDecision.action.action}`, response.rationale);
     const applied = await applyDecision(tabId, cloudDecision, dom);
-    return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom, observed: applied.observed };
+    return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom, observed: applied.observed, tabId: applied.tabId };
   } catch (err) {
     escalationFailures++;
     if (escalationFailures >= MAX_ESCALATION_FAILURES) {
@@ -501,9 +513,9 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
       if (fallback.source === 'heuristic') status.heuristicDecisions++;
       else status.localDecisions++;
       const applied = await applyDecision(tabId, fallback, dom);
-      return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom, observed: applied.observed };
+      return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom, observed: applied.observed, tabId: applied.tabId };
     }
-    return { action: { action: 'done', summary: 'no decision available on-device and escalation failed' }, preDom: dom, postDom: dom, observed: true };
+    return { action: { action: 'done', summary: 'no decision available on-device and escalation failed' }, preDom: dom, postDom: dom, observed: true, tabId };
   }
 }
 
@@ -518,11 +530,15 @@ const reasonOf = (d: AgentDecision): string | undefined => {
  * The best decision that would actually do something, preferring the model's
  * over the ranker's. `done`/`escalate` are not actions, so they do not count.
  */
-function pickActionable(...candidates: (AgentDecision | null)[]): AgentDecision | null {
-  for (const c of candidates) {
-    if (!c) continue;
-    const kind = c.action.action;
-    if (kind !== 'escalate' && kind !== 'done' && kind !== 'invalid') return c;
+function pickActionable(
+  model: AgentDecision | null,
+  ranked: AgentDecision | null,
+): AgentDecision | null {
+  if (model && model.action.action !== 'done' && model.action.action !== 'escalate') {
+    return model;
+  }
+  if (ranked && ranked.action.action !== 'done' && ranked.action.action !== 'escalate') {
+    return ranked;
   }
   return null;
 }
@@ -541,15 +557,27 @@ function repeatedTail(history: readonly AgentAction[]): number {
   return n;
 }
 
+/**
+ * Count consecutive actions that landed on the exact same DOM. A sequence of
+ * three identical post-DOMs means the agent is clicking something that does
+ * nothing; five means it is stuck.
+ */
+function streakOnSameDom(history: AgentAction[], current: ScrubbedDom): number {
+  const key = fingerprint(current);
+  let n = 0;
+  for (let i = history.length - 1; i >= 0 && domFingerprint(history[i]!) === key; i--) n++;
+  return n;
+}
+
 async function applyDecision(
   tabId: number,
   decision: AgentDecision,
   initialPreDom: ScrubbedDom,
-): Promise<{ action: AgentAction; preDom: ScrubbedDom; postDom: ScrubbedDom; observed: boolean }> {
+): Promise<{ action: AgentAction; preDom: ScrubbedDom; postDom: ScrubbedDom; observed: boolean; tabId?: number }> {
   status.lastDecision = decision;
   let action = decision.action;
   if (action.action === 'done' || action.action === 'escalate' || action.action === 'invalid') {
-    return { action, preDom: initialPreDom, postDom: initialPreDom, observed: true };
+    return { action, preDom: initialPreDom, postDom: initialPreDom, observed: true, tabId };
   }
 
   // Safe pre-execution snapshot: avoid unhandled rejection if tab navigated or disconnected during inference
@@ -565,6 +593,7 @@ async function applyDecision(
       preDom: initialPreDom,
       postDom: initialPreDom,
       observed: false,
+      tabId,
     };
   }
 
@@ -623,6 +652,7 @@ async function applyDecision(
           preDom: immediatePreDom,
           postDom: immediatePreDom,
           observed: true,
+          tabId,
         };
       }
     }
@@ -631,22 +661,47 @@ async function applyDecision(
   const res = await execute(tabId, action);
   if (!res.ok) {
     logger.warn('execute', `${action.action} failed`, res.error);
-    return { action: { action: 'invalid', reason: res.error || 'execution failed' }, preDom: immediatePreDom, postDom: immediatePreDom, observed: true };
+    return { action: { action: 'invalid', reason: res.error || 'execution failed' }, preDom: immediatePreDom, postDom: immediatePreDom, observed: true, tabId };
   }
 
   // Adaptive settlement for state-changing actions
-  await sleep(100);
+  await sleep(150);
+
+  // Check if a new tab was opened (e.g. via target="_blank" or window.open)
+  let workingTabId = tabId;
+  if (pendingChildTabId && pendingChildTabId !== tabId) {
+    workingTabId = pendingChildTabId;
+    pendingChildTabId = undefined;
+  } else {
+    try {
+      const activeTabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (activeTabs[0]?.id && activeTabs[0].id !== tabId) {
+        workingTabId = activeTabs[0].id;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  if (workingTabId !== tabId) {
+    logger.info('tabs', `Switching agent focus from tab ${tabId} to new tab ${workingTabId}`);
+    activeAgentTabId = workingTabId;
+    await chrome.tabs.update(workingTabId, { active: true }).catch(() => null);
+    await waitForTabReady(workingTabId);
+    await ensureContentScript(workingTabId);
+  }
+
   let postDom: ScrubbedDom | undefined;
 
   if (action.action === 'navigate') {
-    await waitForTabReady(tabId);
-    await ensureContentScript(tabId);
+    await waitForTabReady(workingTabId);
+    await ensureContentScript(workingTabId);
   }
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      let post = await scrape(tabId);
-      if (action.action === 'click' || action.action === 'fill' || action.action === 'navigate') {
+      let post = await scrape(workingTabId);
+      if (workingTabId === tabId && (action.action === 'click' || action.action === 'fill' || action.action === 'navigate')) {
         if (fingerprint(immediatePreDom) === fingerprint(post.dom) && attempt < 3) {
           await sleep(350);
           continue;
@@ -657,8 +712,8 @@ async function applyDecision(
     } catch (err) {
       logger.warn('execute', `post-execution scrape attempt ${attempt} failed: ${err instanceof Error ? err.message : String(err)}`);
       if (attempt < 3) {
-        await waitForTabReady(tabId, 2000);
-        await ensureContentScript(tabId);
+        await waitForTabReady(workingTabId, 2000);
+        await ensureContentScript(workingTabId);
         await sleep(200);
       }
     }
@@ -670,6 +725,7 @@ async function applyDecision(
     preDom: immediatePreDom,
     postDom: postDom ?? immediatePreDom,
     observed,
+    tabId: workingTabId,
   };
 }
 
@@ -890,7 +946,32 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
   status.plan = undefined;
   const history: AgentAction[] = [];
 
+  let currentTabId = tabId;
+  activeAgentTabId = tabId;
+  pendingChildTabId = undefined;
+
+  const onCreatedListener = (tab: chrome.tabs.Tab) => {
+    if (tab.id && (tab.openerTabId === activeAgentTabId || tab.active)) {
+      pendingChildTabId = tab.id;
+      logger.info('tabs', `Detected child/new tab ${tab.id} created (opener: ${tab.openerTabId})`);
+    }
+  };
+
+  const onActivatedListener = (activeInfo: chrome.tabs.TabActiveInfo) => {
+    if (activeInfo.tabId && activeInfo.tabId !== activeAgentTabId) {
+      pendingChildTabId = activeInfo.tabId;
+      logger.info('tabs', `Detected tab activation to ${activeInfo.tabId}`);
+    }
+  };
+
   try {
+    try {
+      chrome.tabs.onCreated.addListener(onCreatedListener);
+      chrome.tabs.onActivated.addListener(onActivatedListener);
+    } catch {
+      // In test environments where chrome.tabs listeners may not exist
+    }
+
     // Stage A. Where Nano runs is resolved once per service-worker lifetime;
     // logging it is the only way to tell "no Nano on this machine" apart from
     // "Nano is there and the plan really is one step".
@@ -905,7 +986,7 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
 
     // Sub-query the goal. Handing Nano the starting page lets step one name a
     // control that exists instead of restating the goal back at us.
-    const plan = await nano.decompose(goal, await seedDom(tabId));
+    const plan = await nano.decompose(goal, await seedDom(currentTabId));
     const taskMemory: TaskMemory = {
       goal,
       subObjectives: plan.subObjectives,
@@ -950,9 +1031,15 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
       }
 
       taskMemory.step = i + 1;
-      const result = await step(tabId, goal, history, settings, taskMemory);
+      const result = await step(currentTabId, goal, history, settings, taskMemory);
       const action = result.action;
       history.push(action);
+
+      // Track tab switch if the action opened or switched tabs
+      if (result.tabId && result.tabId !== currentTabId) {
+        currentTabId = result.tabId;
+        activeAgentTabId = currentTabId;
+      }
 
       // prevDom for next step
       prevDom = result.postDom;
@@ -1067,6 +1154,14 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
     status.lastError = errorMsg;
     logger.error('agent', `run aborted: ${errorMsg}`);
   } finally {
+    try {
+      chrome.tabs.onCreated.removeListener(onCreatedListener);
+      chrome.tabs.onActivated.removeListener(onActivatedListener);
+    } catch {
+      // In test environments
+    }
+    activeAgentTabId = undefined;
+    pendingChildTabId = undefined;
     running = false;
     status.running = false;
     ws?.close();

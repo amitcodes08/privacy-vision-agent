@@ -82,7 +82,8 @@ describe('createNanoRouter', () => {
     const plan = await router.decompose('Search for shoes and then add to cart');
 
     expect(plan.source).toBe('local-rules');
-    expect(plan.subObjectives).toHaveLength(2);
+    expect(plan.subObjectives).toHaveLength(3);
+    expect(plan.subObjectives[1]?.description).toBe('Click on the shoes product result');
   });
 
   it('delegates decomposition and returns the offscreen plan', async () => {
@@ -115,7 +116,8 @@ describe('createNanoRouter', () => {
     const plan = await router.decompose('Search for shoes and then add to cart');
 
     expect(plan.source).toBe('local-rules');
-    expect(plan.subObjectives).toHaveLength(2);
+    expect(plan.subObjectives).toHaveLength(3);
+    expect(plan.subObjectives[1]?.description).toBe('Click on the shoes product result');
   });
 
   it('delegates a re-plan', async () => {

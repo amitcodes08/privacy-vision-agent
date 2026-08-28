@@ -78,10 +78,36 @@ describe('decomposeWithRules', () => {
     ]);
   });
 
-  it('decomposes compound goals joined by "and" with action verbs', () => {
+  it('decomposes compound goals joined by "and" with action verbs and expands shopping flows', () => {
     const subObjectives = decomposeWithRules('Search for running shoes and add to cart');
 
-    expect(subObjectives.map((s) => s.description)).toEqual(['Search for running shoes', 'Add to cart']);
+    expect(subObjectives.map((s) => s.description)).toEqual([
+      'Search for running shoes',
+      'Click on the running shoes product result',
+      'Add to cart',
+    ]);
+  });
+
+  it('decomposes e-commerce search and add to cart with site name', () => {
+    const subObjectives = decomposeWithRules('Search iPhone on Flipkart and add it to the cart');
+
+    expect(subObjectives.map((s) => s.description)).toEqual([
+      'Search iPhone on Flipkart',
+      'Click on the iPhone product result',
+      'Add it to the cart',
+    ]);
+  });
+
+  it('preserves existing product selection steps without duplicating', () => {
+    const subObjectives = decomposeWithRules(
+      'Search iPhone on Flipkart and click the first result and add to cart',
+    );
+
+    expect(subObjectives.map((s) => s.description)).toEqual([
+      'Search iPhone on Flipkart',
+      'Click the first result',
+      'Add to cart',
+    ]);
   });
 
   it('keeps simple single-step goals as a single sub-objective', () => {
@@ -102,7 +128,8 @@ describe('decomposeGoal', () => {
     const res = await decomposeGoal('Search for noise cancelling headphones and add to cart');
 
     expect(res.source).toBe('local-rules');
-    expect(res.subObjectives).toHaveLength(2);
+    expect(res.subObjectives).toHaveLength(3);
+    expect(res.subObjectives[1]?.description).toBe('Click on the noise cancelling headphones product result');
   });
 
   it('uses Nano steps when a session answers, and marks the first one active', async () => {
@@ -145,7 +172,8 @@ describe('decomposeGoal', () => {
     const res = await decomposeGoal('Search for shoes and add to cart');
 
     expect(res.source).toBe('local-rules');
-    expect(res.subObjectives).toHaveLength(2);
+    expect(res.subObjectives).toHaveLength(3);
+    expect(res.subObjectives[1]?.description).toBe('Click on the shoes product result');
   });
 
   it('falls back to rules when the Nano call rejects', async () => {
@@ -159,7 +187,8 @@ describe('decomposeGoal', () => {
     const res = await decomposeGoal('Search for shoes and then add to cart');
 
     expect(res.source).toBe('local-rules');
-    expect(res.subObjectives).toHaveLength(2);
+    expect(res.subObjectives).toHaveLength(3);
+    expect(res.subObjectives[1]?.description).toBe('Click on the shoes product result');
   });
 
   it('includes the page digest when a DOM is supplied, and omits it otherwise', async () => {
