@@ -41,6 +41,76 @@ const INTENT = {
   navigate: /\b(go\s?to|navigate|visit|browse)\b/i,
 } as const;
 
+type RankingMode = 'search' | 'target' | 'control';
+
+const SEARCH_COMMAND =
+  /\b(?:find|search(?:\s+for)?|look\s+for|lookup|look\s+up|locate|find\s+me|get\s+me|show\s+me)\b/i;
+
+const ACTION_COMMAND =
+  /\b(?:click|press|tap|open|choose|select|pick|accept|agree|allow|dismiss|close|submit|send|login|log\s*in|sign\s*in|register|continue|proceed|confirm|checkout|add|apply|follow|expand|toggle|buy|purchase|remove|delete|save|update)\b/i;
+
+const TARGET_META_WORDS = new Set([
+  'find',
+  'search',
+  'look',
+  'lookup',
+  'locate',
+  'get',
+  'show',
+  'please',
+  'want',
+  'need',
+  'the',
+  'a',
+  'an',
+  'for',
+  'with',
+  'and',
+  'then',
+  'add',
+  'cart',
+  'buy',
+  'purchase',
+  'open',
+  'select',
+  'choose',
+  'pick',
+  'color',
+  'colour',
+  'size',
+  'variant',
+  'version',
+  'storage',
+  'capacity',
+  'price',
+  'budget',
+  'under',
+  'below',
+  'above',
+  'over',
+]);
+
+/**
+ * Generic navigation/UI noise.
+ * These should almost never win when the objective is to find a target.
+ */
+const NAV_NOISE_RE =
+  /\b(?:back\s+to\s+top|skip\s+to\s+content|search\s+this\s+page|privacy|terms(?:\s+of\s+use)?|accessibility|help|feedback|cookie(?:s)?|sign\s+in|join\s+prime|home)\b/i;
+
+/**
+ * Generic "related item" language.
+ * This prevents "iPhone ... case" from beating the actual iPhone.
+ * These are not Amazon-specific; they occur across shopping/product sites.
+ */
+const RELATED_ITEM_RE =
+  /\b(?:case|cover|sleeve|cable|charger|adapter|dock|stand|holder|mount|strap|band|screen\s+protector|protector|replacement|battery|manual|guide|skin|sticker|accessory|accessories|compatible\s+with|for\s+use\s+with)\b/i;
+
+/**
+ * Code/CSS/JS text accidentally surfaced by noisy DOMs.
+ */
+const CODE_LIKE_RE =
+  /(?:\{[^}]*[;:][^}]*\}|#[a-z0-9_-]+\s*\{|\.?[a-z0-9_-]+\s*\{[^}]*[;:])/i;
+
 /**
  * Words that mean the same thing to a user but rarely appear verbatim on the
  * element they are looking for. Expanding these is most of why this planner
@@ -71,20 +141,22 @@ const FILLABLE = new Set(['input', 'textarea']);
 const NON_TEXT_INPUT = new Set(['checkbox', 'radio', 'file', 'range', 'color', 'submit', 'button', 'reset', 'image', 'hidden']);
 
 export function planLocally(input: PlanInput): AgentDecision {
-  const { goal, dom } = input;
   const ranking = rankCandidates(input);
   const best = ranking.candidates[0];
 
-  // Nothing matched. A bare "scroll" goal still has an answer; otherwise the
-  // honest outcome is to stop rather than poke at a random element.
   if (!best) {
     if (ranking.intent.scroll) {
       return {
-        action: { action: 'scroll', deltaY: Math.round(dom.viewport.height * 0.8), reason: 'scroll intent, no target element' },
+        action: {
+          action: 'scroll',
+          deltaY: Math.round(input.dom.viewport.height * 0.8),
+          reason: 'scroll intent, no target element',
+        },
         confidence: 0.7,
         source: 'heuristic',
       };
     }
+
     return {
       action: {
         action: 'invalid',
@@ -96,7 +168,7 @@ export function planLocally(input: PlanInput): AgentDecision {
   }
 
   return {
-    action: toAction(best.node, goal),
+    action: toAction(best.node, input.goal, ranking),
     confidence: scoreToConfidence(best.score, ranking.breadth),
     source: 'heuristic',
   };
@@ -115,11 +187,29 @@ export interface Intent {
 }
 
 export interface Ranking {
-  /** Goal-relevant nodes, most relevant first. Empty when nothing matches. */
   candidates: Candidate[];
-  /** How many expanded goal keywords were searched for; normalises scores. */
+
+  /** Number of meaningful terms used for ranking. */
   breadth: number;
+
   intent: Intent;
+
+  /** What kind of problem the planner thinks this objective represents. */
+  mode: RankingMode;
+
+  /**
+   * Extracted query for search/find objectives.
+   * Example:
+   *   "Find wireless headphones under $100"
+   * becomes:
+   *   "wireless headphones under $100"
+   */
+  searchQuery?: string;
+
+  /**
+   * Meaningful target tokens used for entity/result matching.
+   */
+  targetTokens: string[];
 }
 
 /**
@@ -132,8 +222,10 @@ export interface Ranking {
  */
 export function rankCandidates(input: PlanInput): Ranking {
   const { goal, dom, history = [], taskMemory } = input;
-  const targetGoal = taskMemory?.currentObjective || goal;
-  const wanted = expand(tokenize(targetGoal));
+
+  const targetGoal = taskMemory?.currentObjective?.trim() || goal.trim();
+  const searchQuery = extractSearchQuery(targetGoal);
+  const targetTokens = extractTargetTokens(searchQuery ?? targetGoal);
 
   const intent: Intent = {
     fill: INTENT.fill.test(targetGoal),
@@ -142,26 +234,76 @@ export function rankCandidates(input: PlanInput): Ranking {
     navigate: INTENT.navigate.test(targetGoal),
   };
 
-  // A selector we already acted on twice is a loop; stop preferring it.
   const acted = new Map<string, number>();
+
   for (const h of history) {
-    const sel = 'selector' in h ? h.selector : undefined;
-    if (sel) acted.set(sel, (acted.get(sel) ?? 0) + 1);
-  }
-  // Heavily penalize targets we just attempted that resulted in no state change.
-  if (input.taskMemory?.attemptedTargets) {
-    for (const sel of input.taskMemory.attemptedTargets) {
-      acted.set(sel, (acted.get(sel) ?? 0) + 2);
+    if ('selector' in h && h.selector) {
+      acted.set(h.selector, (acted.get(h.selector) ?? 0) + 1);
     }
+  }
+
+  for (const selector of taskMemory?.attemptedTargets ?? []) {
+    acted.set(selector, (acted.get(selector) ?? 0) + 2);
+  }
+
+  /*
+   * Search mode:
+   *
+   * Only enter this mode when:
+   *   1. the objective looks like a search/find request
+   *   2. a usable search control actually exists
+   *   3. we haven't already used that search control
+   *
+   * This prevents:
+   *
+   * "Find X"
+   *   -> click search box
+   *   -> click same search box forever
+   */
+  const availableSearchControl = dom.nodes.find(
+    (n) =>
+      !n.disabled &&
+      n.visible &&
+      isSearchControl(n) &&
+      !hasRecentFill(history, n.selector) &&
+      !n.value,
+  );
+
+  let mode: RankingMode;
+
+  if (searchQuery && availableSearchControl) {
+    mode = 'search';
+  } else if (searchQuery && targetTokens.length > 0) {
+    mode = 'target';
+  } else {
+    mode = 'control';
   }
 
   const candidates = dom.nodes
     .filter((n) => !n.disabled && n.visible)
-    .map((node) => ({ node, score: scoreNode(node, wanted, intent, acted) }))
+    .map((node) => ({
+      node,
+      score: scoreNode(
+        node,
+        targetTokens,
+        intent,
+        acted,
+        mode,
+        searchQuery,
+        targetGoal,
+      ),
+    }))
     .filter((c) => c.score > 0)
     .sort((a, b) => b.score - a.score);
 
-  return { candidates, breadth: wanted.length, intent };
+  return {
+    candidates,
+    breadth: Math.max(targetTokens.length, 1),
+    intent,
+    mode,
+    searchQuery,
+    targetTokens,
+  };
 }
 
 /**
@@ -201,102 +343,302 @@ const describe = (n: ScrubbedNode): string =>
 
 function scoreNode(
   n: ScrubbedNode,
-  wanted: readonly string[],
+  targetTokens: readonly string[],
   intent: { fill: boolean; click: boolean; scroll: boolean; navigate: boolean },
   acted: Map<string, number>,
+  mode: RankingMode,
+  searchQuery: string | undefined,
+  targetGoal: string,
 ): number {
   const hay = haystack(n);
   if (!hay) return 0;
 
-  let keyword = 0;
-  for (const w of wanted) {
-    if (!w) continue;
-    if (wordMatch(hay, w)) keyword += w.length >= 4 ? w.length : 2;
-    // Partial credit for long tokens only. A 3-letter substring match is
-    // noise — it is what made "log in" fire on a "Blog" link.
-    else if (w.length >= 4 && hay.includes(w)) keyword += w.length / 2;
+  const kind = kindOf(n);
+  const repeats = acted.get(n.selector) ?? 0;
+
+  // Never let repeated failures become increasingly attractive.
+  if (repeats >= 2) return 0;
+
+  /* ---------------------------------------------------------------
+   * SEARCH MODE
+   * ------------------------------------------------------------- */
+
+  if (mode === 'search') {
+    if (!isSearchControl(n)) return 0;
+
+    let score = 20;
+
+    if (n.role === 'searchbox') score += 8;
+    if (n.type === 'search') score += 8;
+
+    const descriptor =
+      `${n.label ?? ''} ${n.placeholder ?? ''} ${n.name ?? ''}`.toLowerCase();
+
+    if (/\bsearch\b/.test(descriptor)) score += 8;
+    if (/\bquery\b/.test(descriptor)) score += 4;
+    if (/\bfind\b/.test(descriptor)) score += 4;
+
+    if (n.value && searchQuery) {
+      const current = normalizeText(n.value);
+      const wanted = normalizeText(searchQuery);
+
+      /*
+       * Already filled with approximately the desired query.
+       * Don't fill/click it again.
+       */
+      if (current.includes(wanted) || wanted.includes(current)) {
+        return 0;
+      }
+    }
+
+    score -= repeats * 12;
+
+    return score;
   }
 
-  // The intent bonus amplifies a real keyword match; it must never create one,
-  // or "click sign in" would click an arbitrary button on a page without one.
+  /* ---------------------------------------------------------------
+   * TARGET MODE
+   *
+   * Example:
+   *   "Find iPhone 17 Pro Max in orange 1TB"
+   *
+   * After the search field has been used, we stop scoring arbitrary
+   * search controls and score actual candidate results.
+   * ------------------------------------------------------------- */
+
+  if (mode === 'target') {
+    if (kind === 'other') return 0;
+
+    let score = 0;
+
+    const meaningfulTokens = targetTokens.filter(isUsefulTargetToken);
+    let matched = 0;
+
+    for (const token of meaningfulTokens) {
+      if (wordMatch(hay, token)) {
+        matched++;
+        score += token.length >= 5 ? 5 : 3;
+      }
+    }
+
+    if (meaningfulTokens.length > 0) {
+      const coverage = matched / meaningfulTokens.length;
+      score += coverage * 12;
+    }
+
+    /*
+     * Exact/multi-word target phrase is much stronger than isolated
+     * token overlap.
+     */
+    if (searchQuery && containsPhrase(hay, searchQuery)) {
+      score += 20;
+    }
+
+    /*
+     * Product/result candidates should generally be actionable.
+     */
+    if (kind === 'click') score += 6;
+    if (n.role === 'link' || n.role === 'button') score += 3;
+
+    /*
+     * Headings inside result cards can still be useful context,
+     * but should not outrank actual clickable results.
+     */
+    if (n.tag === 'h1' || n.tag === 'h2' || n.tag === 'h3') {
+      score += 1;
+    }
+
+    /*
+     * Kill common page chrome / navigation noise.
+     */
+    if (NAV_NOISE_RE.test(hay)) {
+      score -= 16;
+    }
+
+    /*
+     * A product-related objective should not pick:
+     *   iPhone 17 Pro Max CASE
+     * over
+     *   iPhone 17 Pro Max
+     */
+    if (
+      matched >= Math.min(2, meaningfulTokens.length) &&
+      RELATED_ITEM_RE.test(hay)
+    ) {
+      score -= 24;
+    }
+
+    /*
+     * CSS/JS accidentally included in DOM.
+     * Example from your log:
+     * ".apex-savings-percent {font-weight: 300;"
+     */
+    if (CODE_LIKE_RE.test(hay)) {
+      score -= 30;
+    }
+
+    /*
+     * Sponsored/promoted content is not automatically rejected:
+     * a sponsored result can still be the correct target.
+     * We only penalize it.
+     */
+    if (/\b(?:sponsored|promoted|advertisement|advertising)\b/i.test(hay)) {
+      score -= matched >= 2 ? 4 : 10;
+    }
+
+    score -= repeats * 12;
+
+    return Math.max(0, score);
+  }
+
+  /* ---------------------------------------------------------------
+   * CONTROL MODE
+   *
+   * Example:
+   *   "Click Add to cart"
+   *   "Select orange"
+   *   "Open checkout"
+   *   "Close the popup"
+   * ------------------------------------------------------------- */
+
+  let keyword = 0;
+
+  const wanted = expand(tokenize(targetGoal));
+
+  for (const w of wanted) {
+    if (!w) continue;
+
+    if (wordMatch(hay, w)) {
+      keyword += w.length >= 4 ? w.length : 2;
+    } else if (w.length >= 4 && hay.includes(w)) {
+      keyword += w.length / 2;
+    }
+  }
+
   if (keyword < 2) return 0;
 
   let score = keyword;
-  const kind = kindOf(n);
+
   const isChanger = isStateChanger(n);
   const isNav = isNavigator(n);
-  const hasVerb = containsVerb(describe(n));
+  const hasVerb = containsVerb(hay);
 
-  // Intent alignment. Deliberately gentle — a keyword match on the wrong kind
-  // of element is still better than escalating.
-  if (intent.fill && kind === 'fill') score += 6;
-  if (intent.fill && kind === 'click') score -= 2;
+  if (intent.fill && kind === 'fill') score += 8;
+  if (intent.fill && kind === 'click') score -= 5;
 
   if (intent.click) {
     if (isChanger) {
-      score += 6;
+      score += 8;
     } else if (isNav) {
-      if (hasVerb) {
-        score += 4; // Actionable link (e.g. "Add to Cart")
-      } else {
-        score -= 4; // Heavily penalize pure navigation links for state-changing intents
-      }
+      if (hasVerb) score += 4;
+      else score -= 6;
     } else if (kind === 'click') {
-      score += 4; // Fallback for other clickables
+      score += 5;
     }
   } else if (intent.navigate) {
-    if (isNav) {
-      score += 6;
-    } else if (isChanger) {
-      score -= 2;
-    } else if (kind === 'click') {
-      score += 2;
-    }
-  } else {
-    if (!intent.fill && kind !== 'other') score += 2;
+    if (isNav) score += 6;
+    else if (isChanger) score -= 3;
   }
 
-  if (intent.click && kind === 'fill') score -= 2;
+  if (kind === 'other') score -= 8;
 
-  // Prefer things a user can actually operate.
-  if (kind === 'other') score -= 3;
-  if (n.role === 'button' || n.role === 'link' || n.role === 'menuitem') score += 2;
+  if (n.role === 'button' || n.role === 'link' || n.role === 'menuitem') {
+    score += 2;
+  }
 
-  // Loop guard: acting on the same selector repeatedly is never the plan.
-  const repeats = acted.get(n.selector) ?? 0;
-  score -= repeats * 9;
+  if (NAV_NOISE_RE.test(hay)) {
+    score -= 18;
+  }
 
-  // A filled field usually does not need filling again.
-  if (kind === 'fill' && n.value && n.value.length > 0) score -= 3;
+  if (CODE_LIKE_RE.test(hay)) {
+    score -= 30;
+  }
 
-  return score;
+  score -= repeats * 12;
+
+  if (kind === 'fill' && n.value) {
+    score -= 4;
+  }
+
+  return Math.max(0, score);
 }
 
-function toAction(node: ScrubbedNode, goal: string): AgentAction {
+function toAction(
+  node: ScrubbedNode,
+  goal: string,
+  ranking: Ranking,
+): AgentAction {
   const kind = kindOf(node);
+
+  /*
+   * Universal search behavior:
+   *
+   * Find/search/look for X
+   *      ↓
+   * search input
+   *      ↓
+   * fill X
+   *      ↓
+   * submit
+   */
+  if (ranking.mode === 'search' && kind === 'fill') {
+    const query = ranking.searchQuery ?? literalFor(goal);
+
+    if (query) {
+      return {
+        action: 'fill',
+        selector: node.selector,
+        valueType: 'LITERAL',
+        value: query,
+        submit: true,
+        reason: `search objective "${query}"`,
+      };
+    }
+
+    return {
+      action: 'click',
+      selector: node.selector,
+      reason: `focus search control "${describe(node)}"`,
+    };
+  }
 
   if (kind === 'fill') {
     const valueType = inferValueType(node);
+
     if (valueType !== 'LITERAL') {
-      return { action: 'fill', selector: node.selector, valueType, reason: `keyword match on "${describe(node)}"` };
+      return {
+        action: 'fill',
+        selector: node.selector,
+        valueType,
+        reason: `keyword match on "${describe(node)}"`,
+      };
     }
+
     const literal = literalFor(goal);
-    // Without text to type, a literal fill would clear the field for nothing;
-    // focusing it is the honest degradation.
+
     if (!literal) {
-      return { action: 'click', selector: node.selector, reason: `focus "${describe(node)}"` };
+      return {
+        action: 'click',
+        selector: node.selector,
+        reason: `focus "${describe(node)}"`,
+      };
     }
+
     return {
       action: 'fill',
       selector: node.selector,
       valueType,
       value: literal,
-      submit: /\b(search|find|submit|send|go)\b/i.test(goal),
+      submit: /\b(search|find|submit|send|go|query)\b/i.test(goal),
       reason: `keyword match on "${describe(node)}"`,
     };
   }
 
-  return { action: 'click', selector: node.selector, reason: `keyword match on "${describe(node)}"` };
+  return {
+    action: 'click',
+    selector: node.selector,
+    reason: `${ranking.mode} match on "${describe(node)}"`,
+  };
 }
 
 /** Which private value the client should hydrate into this field. */
@@ -314,10 +656,24 @@ export function inferValueType(n: ScrubbedNode): 'USER_EMAIL' | 'USER_FULL_NAME'
  * `search for "wireless mouse"` -> `wireless mouse`.
  */
 export function literalFor(goal: string): string | undefined {
-  const quoted = goal.match(/["“']([^"”']{2,80})["”']/);
-  if (quoted?.[1]) return quoted[1].trim();
-  const after = goal.match(/\b(?:search(?:\s+for)?|type|enter|fill(?:\s+in)?|write|query|look\s+for)\b[:\s]+(.{2,80})$/i);
-  if (after?.[1]) return after[1].replace(/\b(in|into|to)\s+the\s+.*$/i, '').trim() || undefined;
+  const query = extractSearchQuery(goal);
+  if (query) return query;
+
+  const quoted = goal.match(/["“']([^"”']{2,120})["”']/);
+  if (quoted?.[1]) {
+    return quoted[1].trim();
+  }
+
+  const after = goal.match(
+    /\b(?:search(?:\s+for)?|type|enter|fill(?:\s+in)?|write|query|look\s+for)\b[:\s]+(.{2,120})$/i,
+  );
+
+  if (after?.[1]) {
+    return after[1]
+      .replace(/\s+(?:and|then)\s+(?:add|buy|purchase|open|select|choose|click|submit)\b.*$/i, '')
+      .trim();
+  }
+
   return undefined;
 }
 
@@ -364,4 +720,99 @@ function wordMatch(hay: string, needle: string): boolean {
   const before = at === 0 ? ' ' : hay[at - 1]!;
   const after = at + needle.length >= hay.length ? ' ' : hay[at + needle.length]!;
   return !/[a-z0-9]/.test(before) && !/[a-z0-9]/.test(after);
+}
+
+function extractSearchQuery(goal: string): string | undefined {
+  const match = goal.match(
+    /^\s*(?:find(?:\s+me)?|search(?:\s+for)?|look\s+for|lookup|look\s+up|locate|show\s+me|get\s+me)\s+(.+)$/i,
+  );
+
+  if (!match?.[1]) return undefined;
+
+  let query = match[1].trim();
+
+  /*
+   * Stop before a later task instruction.
+   *
+   * "Find wireless headphones and add one to cart"
+   * →
+   * "wireless headphones"
+   */
+  query = query.replace(
+    /\s+(?:and|then)\s+(?:add|buy|purchase|open|select|choose|click|submit|checkout|book|reserve|save)\b.*$/i,
+    '',
+  );
+
+  query = query.replace(/[.!?,;:]+$/, '').trim();
+
+  return query.length >= 2 ? query : undefined;
+}
+
+function extractTargetTokens(text: string): string[] {
+  const tokens = tokenize(text);
+
+  return tokens.filter(
+    (token) => !TARGET_META_WORDS.has(token),
+  );
+}
+
+function isUsefulTargetToken(token: string): boolean {
+  /*
+   * Bare small numbers are dangerous in noisy DOMs.
+   *
+   * "17" matched "17.42 cm" in your Amazon trace.
+   *
+   * We still keep:
+   *   1tb
+   *   128gb
+   *   gen2
+   *   x5
+   */
+  if (/^\d+$/.test(token) && token.length < 4) {
+    return false;
+  }
+
+  return token.length >= 3;
+}
+
+function isSearchControl(n: ScrubbedNode): boolean {
+  if (n.tag !== 'input' && n.role !== 'searchbox' && n.role !== 'combobox') {
+    return false;
+  }
+
+  if (n.type === 'search') return true;
+  if (n.role === 'searchbox') return true;
+
+  const descriptor =
+    `${n.name ?? ''} ${n.label ?? ''} ${n.placeholder ?? ''}`.toLowerCase();
+
+  return /\b(?:search|find|query|lookup)\b/.test(descriptor);
+}
+
+function hasRecentFill(
+  history: readonly AgentAction[],
+  selector: string,
+): boolean {
+  return history.some(
+    (action) =>
+      action.action === 'fill' &&
+      'selector' in action &&
+      action.selector === selector,
+  );
+}
+
+function normalizeText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function containsPhrase(hay: string, phrase: string): boolean {
+  const h = normalizeText(hay);
+  const p = normalizeText(phrase);
+
+  if (!p) return false;
+
+  return h.includes(p);
 }

@@ -177,11 +177,14 @@ export interface BoundingBox {
  * nodes is already replaced with `REDACTED_PLACEHOLDER` on the client.
  */
 export interface ScrubbedNode {
-  /** Stable index used by the model to reference the node. */
   id: number;
   tag: string;
-  /** Deterministic selector the client can resolve back to a live node. */
   selector: string;
+
+  parentId?: number;
+  childIds?: number[];
+  depth?: number;
+
   role?: string;
   type?: string;
   name?: string;
@@ -206,6 +209,74 @@ export interface ScrubbedDom {
   nodes: ScrubbedNode[];
   /** Counts by reason, for the popup's privacy receipt. */
   redactionSummary: Partial<Record<RedactionReason, number>>;
+}
+
+export type UIObjectKind =
+  | 'group'
+  | 'interactive-group'
+  | 'repeated-item'
+  | 'form'
+  | 'navigation'
+  | 'dialog'
+  | 'unknown';
+
+export interface UIObjectAction {
+  action: ActionKind;
+  elementId: number;
+  label?: string;
+  confidence: number;
+}
+
+export interface UIObjectProperty {
+  key: string;
+  value: string;
+  confidence: number;
+  source: 'dom' | 'visual' | 'model';
+}
+
+export interface UIObject {
+  id: string;
+
+  /**
+   * IDs of ScrubbedNode objects belonging to this UI object.
+   */
+  elementIds: number[];
+
+  /**
+   * Human-readable text aggregated from member elements.
+   */
+  text: string[];
+
+  /**
+   * Generic semantic properties. Nothing here is Amazon/ISRO specific.
+   */
+  properties: UIObjectProperty[];
+
+  /**
+   * Actions physically belonging to this object.
+   */
+  actions: UIObjectAction[];
+
+  /**
+   * Approximate visual extent of the object.
+   */
+  box?: BoundingBox;
+
+  /**
+   * Structural classification only.
+   */
+  kind: UIObjectKind;
+
+  confidence: number;
+}
+
+export interface UIObjectGraph {
+  objects: UIObject[];
+
+  /**
+   * node id -> object id
+   */
+  nodeToObject: Record<number, string>;
 }
 
 export const REDACTED_PLACEHOLDER = '[REDACTED]' as const;

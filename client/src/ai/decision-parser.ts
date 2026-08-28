@@ -39,14 +39,35 @@ export function buildPrompt(
   ranking?: Ranking,
   taskMemory?: import('@shared/types').TaskMemory,
 ): string {
-  const ranked = ranking ?? rankCandidates({ goal, dom, history, taskMemory });
-  const relevant = new Set(ranked.candidates.slice(0, GUARANTEED_RELEVANT).map((c) => c.node.id));
+  const ranked =
+    ranking ??
+    rankCandidates({
+      goal,
+      dom,
+      history,
+      taskMemory,
+    });
+
+  const activeObjective =
+    taskMemory?.currentObjective?.trim() || goal;
+
+  const relevant = new Set(
+    ranked.candidates
+      .slice(0, GUARANTEED_RELEVANT)
+      .map((c) => c.node.id),
+  );
 
   const chosen = new Map<number, ScrubbedNode>();
-  for (const c of ranked.candidates.slice(0, GUARANTEED_RELEVANT)) chosen.set(c.node.id, c.node);
+
+  for (const c of ranked.candidates.slice(0, GUARANTEED_RELEVANT)) {
+    chosen.set(c.node.id, c.node);
+  }
+
   for (const n of dom.nodes) {
     if (chosen.size >= PROMPT_BUDGET) break;
-    if (n.visible && !n.disabled) chosen.set(n.id, n);
+    if (n.visible && !n.disabled) {
+      chosen.set(n.id, n);
+    }
   }
 
   const lines = [...chosen.values()]
@@ -55,58 +76,89 @@ export function buildPrompt(
       const bits = [
         n.tag,
         n.type && `type=${n.type}`,
+        n.role && `role=${n.role}`,
         n.label && `label="${trunc(n.label)}"`,
         n.text && `text="${trunc(n.text)}"`,
-        n.value && `value="${trunc(n.value)}"`,
+        n.placeholder && `placeholder="${trunc(n.placeholder)}"`,
       ]
         .filter(Boolean)
         .join(' ');
-      return `${n.id}: ${bits}${relevant.has(n.id) ? '  <-- mentions your goal' : ''}`;
+
+      return `${n.id}: ${bits}${
+        relevant.has(n.id) ? '  <-- relevant candidate' : ''
+      }`;
     });
 
   const past = history
-    .slice(-3)
-    .map((h) => ('selector' in h ? `${h.action}(${h.selector})` : h.action))
+    .slice(-4)
+    .map((h) =>
+      'selector' in h
+        ? `${h.action}(${h.selector})`
+        : h.action,
+    )
     .join(', ');
 
-  // The element *id* is what the model must return — a short integer it can
-  // copy reliably. Selectors are resolved from the id on our side, which
-  // removes the single largest source of unusable local output.
-  //
-  // Completion reasoning is ordered FIRST: the model checks whether the goal
-  // is already satisfied before choosing any action. This matches the control
-  // flow in the agent loop, which runs a cheap DOM check before the VLM call
-  // and expects the VLM to corroborate with a `done` when appropriate.
+  const modeGuidance =
+    ranked.mode === 'search'
+      ? [
+          'MODE: SEARCH',
+          'Choose the search field that can accept the requested query.',
+          ranked.searchQuery
+            ? `SEARCH QUERY: "${ranked.searchQuery}"`
+            : '',
+          'Do not choose unrelated links, navigation, ads, or page text.',
+        ]
+      : ranked.mode === 'target'
+        ? [
+            'MODE: TARGET SELECTION',
+            'Choose the visible actionable element that best identifies the requested target.',
+            'Prefer the requested object itself over accessories, replacements, covers, cables, ads, or unrelated navigation.',
+            'Use both the screenshot and the element text.',
+          ]
+        : [
+            'MODE: UI ACTION',
+            'Choose the single actionable element that best matches the active objective.',
+          ];
+
   return [
-    'You are a browser agent. Look at the screenshot carefully.',
-    `GOAL: ${goal}`,
-    `PAGE: ${trunc(dom.title, 80)}`,
+    'You are a browser action selector.',
+    'Use the screenshot as the primary visual source and the element list as grounding.',
     '',
-    'STEP 1 — COMPLETION CHECK (do this first):',
-    'Is the GOAL already fully satisfied by what you see on the current page?',
-    '  • If YES → respond with: {"action":"done","summary":"<one sentence explaining why the goal is satisfied>"}',
-    '  • If NO  → proceed to STEP 2.',
+    `OVERALL GOAL: ${goal}`,
+    `ACTIVE OBJECTIVE: ${activeObjective}`,
     '',
-    'STEP 2 — NEXT ACTION (only if goal is NOT yet satisfied):',
-    'Pick the ONE best next action from the elements below.',
-    'ELEMENTS (id: description):',
+    ...modeGuidance,
+    '',
+    'IMPORTANT:',
+    '- Solve ONLY the ACTIVE OBJECTIVE.',
+    '- Perform exactly ONE action.',
+    '- Never invent an element id.',
+    '- Never choose an element merely because one word matches.',
+    '- Prefer a semantically correct target over a generic page control.',
+    '- Do not repeat an action already attempted unsuccessfully.',
+    '- Do NOT return "done". Completion is verified by the controller.',
+    '- Do NOT put explanations outside JSON.',
+    '',
+    'ELEMENTS:',
     lines.join('\n'),
     '',
-    'TASK MEMORY:',
-    `Current Objective: ${taskMemory?.currentObjective || 'Not set'}`,
-    taskMemory?.completedObjectives?.length ? `Completed: ${taskMemory.completedObjectives.map((o) => o.description).join(', ')}` : '',
-    past && `ALREADY DONE: ${past} — do not repeat these.`,
-    taskMemory?.attemptedTargets?.length ? `ATTEMPTED BUT FAILED TARGETS: ${taskMemory.attemptedTargets.join(', ')}` : '',
+    'RECENT ACTIONS:',
+    past || 'none',
     '',
-    'Answer with one JSON object and nothing else.',
-    'Keys:',
-    ' - "action" (one of click, fill, scroll, done, escalate)',
-    ' - "id" (an element id from the list above)',
-    ' - "completedObjective" (optional string if you just accomplished your previous objective)',
-    ' - "currentObjective" (optional string describing what you are trying to accomplish right now)',
-    'For fill, also include "valueType" (e.g. USER_EMAIL, LITERAL) and "value".',
+    taskMemory?.attemptedTargets?.length
+      ? `FAILED TARGETS: ${taskMemory.attemptedTargets.join(', ')}`
+      : '',
     '',
-    'You MUST output ONLY valid JSON. No markdown formatting, no explanations, no text outside the JSON object.',
+    'OUTPUT EXACTLY ONE JSON OBJECT:',
+    '{"action":"click","id":123}',
+    '{"action":"fill","id":123,"valueType":"LITERAL","value":"text"}',
+    '{"action":"scroll","deltaY":600}',
+    '',
+    'Allowed actions: click, fill, scroll, escalate',
+    'For click: "id" is required.',
+    'For fill: "id", "valueType", and "value" are required.',
+    'For scroll: "deltaY" is optional.',
+    'Return JSON only.',
   ]
     .filter(Boolean)
     .join('\n');
