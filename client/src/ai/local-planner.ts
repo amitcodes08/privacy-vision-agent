@@ -43,12 +43,6 @@ const INTENT = {
 
 type RankingMode = 'search' | 'target' | 'control';
 
-const SEARCH_COMMAND =
-  /\b(?:find|search(?:\s+for)?|look\s+for|lookup|look\s+up|locate|find\s+me|get\s+me|show\s+me)\b/i;
-
-const ACTION_COMMAND =
-  /\b(?:click|press|tap|open|choose|select|pick|accept|agree|allow|dismiss|close|submit|send|login|log\s*in|sign\s*in|register|continue|proceed|confirm|checkout|add|apply|follow|expand|toggle|buy|purchase|remove|delete|save|update)\b/i;
-
 const TARGET_META_WORDS = new Set([
   'find',
   'search',
@@ -95,7 +89,7 @@ const TARGET_META_WORDS = new Set([
  * These should almost never win when the objective is to find a target.
  */
 const NAV_NOISE_RE =
-  /\b(?:back\s+to\s+top|skip\s+to\s+content|search\s+this\s+page|privacy|terms(?:\s+of\s+use)?|accessibility|help|feedback|cookie(?:s)?|sign\s+in|join\s+prime|home)\b/i;
+  /\b(?:back\s+to\s+top|skip\s+to\s+content|search\s+this\s+page|privacy|terms(?:\s+of\s+use)?|accessibility|help|feedback|cookie(?:s)?|join\s+prime|home)\b/i;
 
 /**
  * Generic "related item" language.
@@ -656,13 +650,13 @@ export function inferValueType(n: ScrubbedNode): 'USER_EMAIL' | 'USER_FULL_NAME'
  * `search for "wireless mouse"` -> `wireless mouse`.
  */
 export function literalFor(goal: string): string | undefined {
-  const query = extractSearchQuery(goal);
-  if (query) return query;
-
   const quoted = goal.match(/["“']([^"”']{2,120})["”']/);
   if (quoted?.[1]) {
     return quoted[1].trim();
   }
+
+  const query = extractSearchQuery(goal);
+  if (query) return query.replace(/^["'“](.+)["'”]$/, '$1').trim();
 
   const after = goal.match(
     /\b(?:search(?:\s+for)?|type|enter|fill(?:\s+in)?|write|query|look\s+for)\b[:\s]+(.{2,120})$/i,
@@ -671,6 +665,7 @@ export function literalFor(goal: string): string | undefined {
   if (after?.[1]) {
     return after[1]
       .replace(/\s+(?:and|then)\s+(?:add|buy|purchase|open|select|choose|click|submit)\b.*$/i, '')
+      .replace(/^["'“](.+)["'”]$/, '$1')
       .trim();
   }
 
@@ -743,7 +738,9 @@ function extractSearchQuery(goal: string): string | undefined {
     '',
   );
 
+  query = query.replace(/^["'“](.+)["'”]$/, '$1');
   query = query.replace(/[.!?,;:]+$/, '').trim();
+  query = query.replace(/^["'“](.+)["'”]$/, '$1').trim();
 
   return query.length >= 2 ? query : undefined;
 }

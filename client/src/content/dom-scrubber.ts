@@ -1003,13 +1003,6 @@ export function buildScrubbedDom(
         node.value = squash(rawValue);
       }
     }
-      } else {
-        node.value =
-          squash(
-            rawValue,
-          );
-      }
-    }
 
     /* ------------------------------------------------------------ *
      * Element-level redaction reasons

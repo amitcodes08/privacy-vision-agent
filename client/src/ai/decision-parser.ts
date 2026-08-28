@@ -77,6 +77,8 @@ export function buildPrompt(
         n.tag,
         n.type && `type=${n.type}`,
         n.role && `role=${n.role}`,
+        n.label && `label="${trunc(n.label)}"`,
+        n.text && `text="${trunc(n.text)}"`,
         n.placeholder && `placeholder="${trunc(n.placeholder)}"`,
         n.context && `context="${trunc(n.context)}"`,
         n.value && `value="${trunc(n.value)}"`,
@@ -85,7 +87,7 @@ export function buildPrompt(
         .join(' ');
 
       return `${n.id}: ${bits}${
-        relevant.has(n.id) ? '  <-- relevant candidate' : ''
+        relevant.has(n.id) ? '  <-- mentions your goal' : ''
       }`;
     });
 
@@ -143,7 +145,7 @@ export function buildPrompt(
     lines.join('\n'),
     '',
     'RECENT ACTIONS:',
-    past || 'none',
+    past ? `${past} — do not repeat these.` : 'none',
     '',
     taskMemory?.attemptedTargets?.length
       ? `FAILED TARGETS: ${taskMemory.attemptedTargets.join(', ')}`
