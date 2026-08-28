@@ -367,9 +367,39 @@ export function decomposeWithRules(goal: string): TaskObjective[] {
     }
   }
 
+  // Expand shopping workflows where search is directly followed by add to cart / buy without a product selection step
+  clauses = expandShoppingFlows(clauses);
+
   const subObjectives = toObjectives(clauses.map(normalizeClause).filter(Boolean));
 
   return subObjectives.length > 0 ? subObjectives : [{ id: 1, description: goal, status: 'active' }];
+}
+
+/**
+ * Detects if a sequence contains search followed directly by add-to-cart/buy,
+ * and inserts a product selection step if missing (since search leads to a results page).
+ * e.g., ["Search iPhone on Flipkart", "Add it to the cart"]
+ *    -> ["Search iPhone on Flipkart", "Click on the iPhone product result", "Add it to the cart"]
+ */
+function expandShoppingFlows(clauses: string[]): string[] {
+  const result: string[] = [];
+  for (let i = 0; i < clauses.length; i++) {
+    const curr = clauses[i]!;
+    result.push(curr);
+    const next = clauses[i + 1];
+    if (next) {
+      const isSearch = /\b(?:search|find|lookup|query)\b/i.test(curr);
+      const isCartOrBuy = /\b(?:add\s+(?:it\s+)?(?:to\s+(?:the\s+)?)?(?:cart|bag|basket)|buy\s+(?:it|now)?|purchase)\b/i.test(next);
+      const hasProductSelection = /\b(?:click|select|choose|open|view|pick)\b/i.test(next);
+      if (isSearch && isCartOrBuy && !hasProductSelection) {
+        let item = curr.replace(/^(?:search|find|lookup|query)\s+(?:for\s+)?/i, '').trim();
+        item = item.replace(/\s+(?:on|in|at|from)\s+[a-z0-9\s_-]+$/i, '').trim();
+        if (!item) item = 'product';
+        result.push(`Click on the ${item} product result`);
+      }
+    }
+  }
+  return result;
 }
 
 /**
