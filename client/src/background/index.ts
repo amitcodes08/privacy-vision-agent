@@ -557,18 +557,6 @@ function repeatedTail(history: readonly AgentAction[]): number {
   return n;
 }
 
-/**
- * Count consecutive actions that landed on the exact same DOM. A sequence of
- * three identical post-DOMs means the agent is clicking something that does
- * nothing; five means it is stuck.
- */
-function streakOnSameDom(history: AgentAction[], current: ScrubbedDom): number {
-  const key = fingerprint(current);
-  let n = 0;
-  for (let i = history.length - 1; i >= 0 && domFingerprint(history[i]!) === key; i--) n++;
-  return n;
-}
-
 async function applyDecision(
   tabId: number,
   decision: AgentDecision,
@@ -957,7 +945,7 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
     }
   };
 
-  const onActivatedListener = (activeInfo: chrome.tabs.TabActiveInfo) => {
+  const onActivatedListener = (activeInfo: chrome.tabs.OnActivatedInfo) => {
     if (activeInfo.tabId && activeInfo.tabId !== activeAgentTabId) {
       pendingChildTabId = activeInfo.tabId;
       logger.info('tabs', `Detected tab activation to ${activeInfo.tabId}`);
