@@ -397,24 +397,46 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
   if (decision && decision.confidence >= settings.confidenceThreshold && decision.action.action !== 'escalate') {
     // --- VLM-done corroboration: verify a done signal against the DOM ------
     if (decision.action.action === 'done') {
-      const domSignal = checkTermination({ goal, dom, history, taskMemory });
-      const corroborated = corroborateDone(decision.confidence, domSignal);
-      if (corroborated.done && corroborated.confidence >= HIGH_CONFIDENCE) {
-        logger.info('local', `vlm done corroborated by dom (${corroborated.reason}); stopping`);
-        status.localDecisions++;
-        return { action: decision.action, preDom: dom, postDom: dom, observed: true };
-      }
-      if (!corroborated.done) {
-        // DOM contradicts — treat as if the VLM did not decide.
+      const activeObjective =
+        taskMemory.currentObjective?.trim() || goal;
+
+      const domSignal = checkTermination({
+        goal: activeObjective,
+        dom,
+        history,
+        taskMemory,
+      });
+
+      const corroborated = corroborateDone(
+        decision.confidence,
+        domSignal,
+      );
+
+      if (
+        corroborated.done &&
+        corroborated.confidence >= HIGH_CONFIDENCE
+      ) {
         logger.info(
           'local',
-          `vlm says done but dom contradicts (${corroborated.reason}); continuing`,
+          `vlm done corroborated by objective DOM evidence (${corroborated.reason}); stopping objective`,
         );
-        decision = null;
-      } else {
+
         status.localDecisions++;
-        return { action: decision.action, preDom: dom, postDom: dom, observed: true };
+
+        return {
+          action: decision.action,
+          preDom: dom,
+          postDom: dom,
+          observed: true,
+        };
       }
+
+      logger.info(
+        'local',
+        `rejected vlm done for active objective (${corroborated.reason}); continuing`,
+      );
+
+      decision = null;
     } else {
       status.localDecisions++;
       const applied = await applyDecision(tabId, decision, dom);
@@ -485,9 +507,93 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
     escalationFailures = 0;
     status.escalations++;
     const cloudDecision = sanitiseCloudAction(response.decision);
-    logger.info('escalate', `cloud decision ${cloudDecision.action.action}`, response.rationale);
-    const applied = await applyDecision(tabId, cloudDecision, dom);
-    return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom, observed: applied.observed };
+
+    if (cloudDecision.action.action === 'done') {
+      const activeObjective =
+        taskMemory.currentObjective?.trim() || goal;
+
+      const domSignal = checkTermination({
+        goal: activeObjective,
+        dom,
+        history,
+        taskMemory,
+      });
+
+      const corroborated = corroborateDone(
+        cloudDecision.confidence,
+        domSignal,
+      );
+
+      if (
+        !corroborated.done ||
+        corroborated.confidence < HIGH_CONFIDENCE
+      ) {
+        logger.warn(
+          'escalate',
+          `cloud done rejected for active objective: ${corroborated.reason}`,
+        );
+
+        /*
+         * Do not execute a hallucinated DONE.
+         * Immediately give the deterministic planner one chance.
+         */
+        const fallback = planLocally({
+          goal,
+          dom,
+          history,
+          taskMemory,
+        });
+
+        if (
+          fallback.action.action !== 'invalid' &&
+          fallback.action.action !== 'done' &&
+          fallback.action.action !== 'escalate' &&
+          fallback.confidence >= 0.60
+        ) {
+          const applied = await applyDecision(
+            tabId,
+            fallback,
+            dom,
+          );
+
+          return {
+            action: applied.action,
+            preDom: applied.preDom,
+            postDom: applied.postDom,
+            observed: applied.observed,
+          };
+        }
+
+        return {
+          action: {
+            action: 'invalid',
+            reason: 'cloud model claimed completion without objective evidence',
+          },
+          preDom: dom,
+          postDom: dom,
+          observed: true,
+        };
+      }
+    }
+
+    logger.info(
+      'escalate',
+      `cloud decision ${cloudDecision.action.action}`,
+      response.rationale,
+    );
+
+    const applied = await applyDecision(
+      tabId,
+      cloudDecision,
+      dom,
+    );
+
+    return {
+      action: applied.action,
+      preDom: applied.preDom,
+      postDom: applied.postDom,
+      observed: applied.observed,
+    };
   } catch (err) {
     escalationFailures++;
     if (escalationFailures >= MAX_ESCALATION_FAILURES) {
@@ -591,21 +697,21 @@ async function applyDecision(
         (n) =>
           n.tag === origNode.tag &&
           ((origNode.label && n.label === origNode.label) ||
-           (origNode.name && n.name === origNode.name) ||
-           (origNode.placeholder && n.placeholder === origNode.placeholder) ||
-           (origNode.text && n.text === origNode.text)),
+            (origNode.name && n.name === origNode.name) ||
+            (origNode.placeholder && n.placeholder === origNode.placeholder) ||
+            (origNode.text && n.text === origNode.text)),
       );
 
       // Disambiguate by spatial proximity when the original position is known.
       const closest =
         candidates.length > 1 && origBox
           ? candidates
-              .slice()
-              .sort(
-                (a, b) =>
-                  Math.hypot((a.box?.x ?? 0) - origBox.x, (a.box?.y ?? 0) - origBox.y) -
-                  Math.hypot((b.box?.x ?? 0) - origBox.x, (b.box?.y ?? 0) - origBox.y),
-              )[0]
+            .slice()
+            .sort(
+              (a, b) =>
+                Math.hypot((a.box?.x ?? 0) - origBox.x, (a.box?.y ?? 0) - origBox.y) -
+                Math.hypot((b.box?.x ?? 0) - origBox.x, (b.box?.y ?? 0) - origBox.y),
+            )[0]
           : candidates.length === 1
             ? candidates[0]
             : undefined;
@@ -752,9 +858,10 @@ async function subObjectiveSatisfied(
   result: StepResult,
   history: readonly AgentAction[],
 ): Promise<{ done: boolean; why: string }> {
-  if (action.completedObjective) {
-    return { done: true, why: `model reported "${action.completedObjective}"` };
-  }
+  /*
+   * completedObjective is a MODEL CLAIM, not evidence.
+   * Never advance solely because the model wrote it.
+   */
 
   const domSignal = checkTermination({
     goal: objective,
@@ -763,16 +870,40 @@ async function subObjectiveSatisfied(
     prevDom: result.preDom,
     history: [...history],
   });
-  if (domSignal.done && domSignal.confidence >= HIGH_CONFIDENCE) {
-    return { done: true, why: `dom: ${domSignal.reason}` };
+
+  if (
+    domSignal.done &&
+    domSignal.confidence >= HIGH_CONFIDENCE
+  ) {
+    return {
+      done: true,
+      why: `dom: ${domSignal.reason}`,
+    };
   }
 
-  const verdict = await nano.verify({ objective, dom: result.postDom, lastAction: action });
-  if (verdict.satisfied && verdict.confidence > 0) {
-    return { done: true, why: `nano: ${verdict.reason}` };
+  const verdict = await nano.verify({
+    objective,
+    dom: result.postDom,
+    lastAction: action,
+  });
+
+  if (
+    verdict.satisfied &&
+    verdict.confidence > 0
+  ) {
+    return {
+      done: true,
+      why: `nano: ${verdict.reason}`,
+    };
   }
 
-  return { done: false, why: verdict.source === 'gemini-nano' ? `nano: ${verdict.reason}` : domSignal.reason };
+  return {
+    done: false,
+    why:
+      verdict.source === 'gemini-nano'
+        ? `nano: ${verdict.reason}`
+        : domSignal.reason,
+  };
 }
 
 /**
@@ -965,7 +1096,10 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
       }
 
       // Post-step completion check only if post-action DOM was observed
-      if (result.observed) {
+      if (
+        result.observed &&
+        activeIndexOf(taskMemory) === -1
+      ) {
         const postSignal = checkTermination({
           goal,
           dom: result.postDom,
@@ -974,9 +1108,21 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
           prevDom: result.preDom,
           taskMemory,
         });
-        if (postSignal.done && postSignal.confidence >= HIGH_CONFIDENCE) {
-          logger.info('termination', `post-step exit after step ${i + 1}: ${postSignal.reason}`);
-          history.push({ action: 'done', summary: postSignal.reason });
+
+        if (
+          postSignal.done &&
+          postSignal.confidence >= HIGH_CONFIDENCE
+        ) {
+          logger.info(
+            'termination',
+            `post-step exit after step ${i + 1}: ${postSignal.reason}`,
+          );
+
+          history.push({
+            action: 'done',
+            summary: postSignal.reason,
+          });
+
           break;
         }
       }
