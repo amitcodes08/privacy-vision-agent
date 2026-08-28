@@ -5,7 +5,17 @@
  * WebGPU worker. The only bytes that reach `WsClient` come out of
  * `redactFrame()`, and only when neither on-device planner could decide.
  *
- * Decision ladder, in order. The whole point is that step 3 is rare:
+ * Two stages, and they answer different questions.
+ *
+ * Stage A — *what* to do, via Gemini Nano's sub-query engine. A complex goal is
+ * decomposed into atomic sub-objectives before the first action, and rewritten
+ * against the real page whenever a sub-objective stalls. Nano is not in the
+ * decision ladder below: it never picks an element, it only decides what the
+ * current sub-goal is. It lives in the offscreen document, because Chrome
+ * exposes the Prompt API to documents and not to workers — see `nano-bridge.ts`.
+ *
+ * Stage B — *how* to do it, one sub-objective at a time. The whole point is that
+ * step 3 is rare:
  *   1. local VLM  (WebGPU, unredacted frame, no network)
  *   2. local deterministic planner  (no model, no network)
  *   3. redacted escalation to the server  (last resort, opt-out-able)
@@ -18,6 +28,7 @@ import {
   type BoundingBox,
   type ScrubbedDom,
   type TaskMemory,
+  type TaskObjective,
   type ActionResultCategory,
 } from '@shared/types';
 import { redactFrame, dataUrlToBitmap, downscaleFrame } from '~/privacy/canvas-redactor';
@@ -28,7 +39,8 @@ import { logger, recentLogs } from '~/lib/log';
 import { checkTermination, corroborateDone, HIGH_CONFIDENCE } from '~/ai/termination-checker';
 import { makeStagnationState, recordAndCheck, fingerprint } from '~/ai/stagnation-guard';
 import { sanitiseCloudAction } from '~/ai/decision-parser';
-import { decomposeGoal } from '~/ai/nano-query-planner';
+import { createNanoRouter } from '~/ai/nano-bridge';
+import type { NanoProbe } from '~/ai/nano-session';
 
 const OFFSCREEN_PATH = 'src/offscreen/index.html';
 
@@ -557,9 +569,14 @@ async function applyDecision(
   }
 
   // Reconcile stale selectors if DOM updated during inference
-  if ('selector' in action && action.selector && fingerprint(initialPreDom) !== fingerprint(immediatePreDom)) {
-    const origNode = initialPreDom.nodes.find((n) => n.selector === action.selector);
-    const targetNode = immediatePreDom.nodes.find((n) => n.selector === action.selector);
+  //
+  // `staleSelector` is captured rather than read through `action` inside the
+  // closures below: `action` is reassigned in this block, so TypeScript drops
+  // the `'selector' in action` narrowing for anything a callback captures.
+  const staleSelector = 'selector' in action ? action.selector : undefined;
+  if (staleSelector && fingerprint(initialPreDom) !== fingerprint(immediatePreDom)) {
+    const origNode = initialPreDom.nodes.find((n) => n.selector === staleSelector);
+    const targetNode = immediatePreDom.nodes.find((n) => n.selector === staleSelector);
 
     const isSameElement =
       origNode &&
@@ -568,6 +585,7 @@ async function applyDecision(
       (origNode.name === targetNode.name || origNode.label === targetNode.label || origNode.text === targetNode.text);
 
     if (!isSameElement && origNode) {
+      const origBox = origNode.box;
       // Find all candidates in the updated DOM matching the original node's key semantic attributes
       const candidates = immediatePreDom.nodes.filter(
         (n) =>
@@ -578,22 +596,30 @@ async function applyDecision(
            (origNode.text && n.text === origNode.text)),
       );
 
-      if (candidates.length === 1) {
-        logger.info('execute', `reconciled stale selector ${action.selector} -> ${candidates[0].selector}`);
-        action = { ...action, selector: candidates[0].selector };
-      } else if (candidates.length > 1 && origNode.box) {
-        // Disambiguate by spatial proximity if bounding box is known
-        const closest = candidates.slice().sort((a, b) => {
-          const distA = Math.hypot((a.box?.x ?? 0) - origNode.box!.x, (a.box?.y ?? 0) - origNode.box!.y);
-          const distB = Math.hypot((b.box?.x ?? 0) - origNode.box!.x, (b.box?.y ?? 0) - origNode.box!.y);
-          return distA - distB;
-        })[0];
-        logger.info('execute', `disambiguated stale selector ${action.selector} -> ${closest.selector}`);
-        action = { ...action, selector: closest.selector };
+      // Disambiguate by spatial proximity when the original position is known.
+      const closest =
+        candidates.length > 1 && origBox
+          ? candidates
+              .slice()
+              .sort(
+                (a, b) =>
+                  Math.hypot((a.box?.x ?? 0) - origBox.x, (a.box?.y ?? 0) - origBox.y) -
+                  Math.hypot((b.box?.x ?? 0) - origBox.x, (b.box?.y ?? 0) - origBox.y),
+              )[0]
+          : candidates.length === 1
+            ? candidates[0]
+            : undefined;
+
+      if (closest) {
+        const how = candidates.length === 1 ? 'reconciled' : 'disambiguated';
+        logger.info('execute', `${how} stale selector ${staleSelector} -> ${closest.selector}`);
+        // Re-narrow: `staleSelector` came off this same action, but reading it
+        // through a separate const means TS no longer knows that.
+        if ('selector' in action) action = { ...action, selector: closest.selector };
       } else {
-        logger.warn('execute', `stale selector ${action.selector} has ${candidates.length} matches in updated DOM; rejecting for safety`);
+        logger.warn('execute', `stale selector ${staleSelector} has ${candidates.length} matches in updated DOM; rejecting for safety`);
         return {
-          action: { action: 'invalid', reason: `target element ambiguous or vanished after DOM change (${action.selector})` },
+          action: { action: 'invalid', reason: `target element ambiguous or vanished after DOM change (${staleSelector})` },
           preDom: immediatePreDom,
           postDom: immediatePreDom,
           observed: true,
@@ -648,6 +674,207 @@ async function applyDecision(
 }
 
 
+/* ---------------------------------------------------------------- *
+ * Stage A: the Gemini Nano sub-query engine
+ * ---------------------------------------------------------------- */
+
+/**
+ * Nano runs wherever the Prompt API exists — in practice the offscreen
+ * document, reached over the same channel as the VLM.
+ */
+const nano = createNanoRouter((msg) => askOffscreen(msg));
+
+/**
+ * Re-plans allowed per run. Each one costs a Nano generation and resets the
+ * plan the user is watching, and a goal that needs a third rewrite is a goal
+ * this agent is not going to finish.
+ */
+const MAX_REPLANS = 2;
+
+const activeIndexOf = (tm: TaskMemory): number =>
+  tm.subObjectives?.findIndex((s) => s.status === 'active') ?? -1;
+
+/** Mirror the plan into `status` so the popup can render the checklist. */
+function publishPlan(tm: TaskMemory): void {
+  status.plan = {
+    source: tm.planSource ?? 'local-rules',
+    objectives: (tm.subObjectives ?? []).map((o) => ({ ...o })),
+    replans: tm.replans ?? 0,
+  };
+}
+
+/**
+ * Retire the active sub-objective and activate the next one.
+ * Returns false when that was the last, i.e. the whole goal is done.
+ */
+function advanceObjective(tm: TaskMemory, why: string): boolean {
+  const subs = tm.subObjectives;
+  const at = activeIndexOf(tm);
+  const current = subs?.[at];
+  if (!subs || !current) return false;
+
+  current.status = 'completed';
+  tm.completedObjectives.push({ ...current });
+  tm.attemptedTargets = [];
+  logger.info('task', `completed sub-objective [${at + 1}/${subs.length}]: ${current.description}`, why);
+
+  const next = subs[at + 1];
+  if (next) {
+    next.status = 'active';
+    tm.currentObjective = next.description;
+    logger.info('task', `advancing to [${at + 2}/${subs.length}]: ${next.description}`);
+    publishPlan(tm);
+    return true;
+  }
+
+  tm.currentObjective = undefined;
+  logger.info('task', 'all sub-objectives finished');
+  publishPlan(tm);
+  return false;
+}
+
+/**
+ * Did the active sub-objective just land?
+ *
+ * Three judges, cheapest first: an explicit `completedObjective` from whichever
+ * model chose the action, the deterministic DOM checker, then Nano looking at
+ * the page. Any one of them is enough to advance.
+ *
+ * That asymmetry is deliberate. A missed advance strands the agent on a
+ * finished sub-goal until the step budget runs out and the run fails; an early
+ * advance is self-correcting, because the next sub-objective's own check will
+ * not fire and a re-plan gets to look at the real page. Nano is asked last so a
+ * generation is skipped entirely whenever the free evidence already answered.
+ */
+async function subObjectiveSatisfied(
+  objective: string,
+  action: AgentAction,
+  result: StepResult,
+  history: readonly AgentAction[],
+): Promise<{ done: boolean; why: string }> {
+  if (action.completedObjective) {
+    return { done: true, why: `model reported "${action.completedObjective}"` };
+  }
+
+  const domSignal = checkTermination({
+    goal: objective,
+    dom: result.postDom,
+    lastAction: action,
+    prevDom: result.preDom,
+    history: [...history],
+  });
+  if (domSignal.done && domSignal.confidence >= HIGH_CONFIDENCE) {
+    return { done: true, why: `dom: ${domSignal.reason}` };
+  }
+
+  const verdict = await nano.verify({ objective, dom: result.postDom, lastAction: action });
+  if (verdict.satisfied && verdict.confidence > 0) {
+    return { done: true, why: `nano: ${verdict.reason}` };
+  }
+
+  return { done: false, why: verdict.source === 'gemini-nano' ? `nano: ${verdict.reason}` : domSignal.reason };
+}
+
+/**
+ * Rewrite the remaining plan against the page actually in front of us.
+ *
+ * This is the case a decomposition made before the agent saw any page cannot
+ * handle. "Filter by price under $500" is a reasonable sub-goal and not a
+ * control that exists on most sites; the vision tier then hunts for an element
+ * that was never there, the stagnation guard fires, and the run dies having
+ * done the first half of the task. Given the page's element list, Nano can
+ * re-say the outstanding work in terms the vision tier can ground.
+ *
+ * Superseded objectives are marked `skipped` rather than dropped, so the popup
+ * still shows the plan the run started with and `checkTermination` does not
+ * count them as outstanding work.
+ */
+async function tryReplan(
+  tm: TaskMemory,
+  dom: ScrubbedDom,
+  history: readonly AgentAction[],
+  reason: string,
+): Promise<boolean> {
+  const spent = tm.replans ?? 0;
+  if (spent >= MAX_REPLANS) {
+    logger.info('plan', `stalled (${reason}) with the re-plan budget spent (${spent}/${MAX_REPLANS})`);
+    return false;
+  }
+
+  const subs = tm.subObjectives ?? [];
+  const at = activeIndexOf(tm);
+  const remaining = at === -1 ? [] : subs.slice(at).filter((s) => s.status !== 'completed' && s.status !== 'skipped');
+  if (remaining.length === 0) return false;
+
+  const res = await nano.replan({
+    goal: tm.goal,
+    remaining,
+    completed: tm.completedObjectives,
+    dom,
+    history: [...history],
+    reason,
+  });
+  if (!res.changed || res.subObjectives.length === 0) {
+    logger.info('plan', `no usable re-plan for "${reason}"; falling through`);
+    return false;
+  }
+
+  for (const s of subs.slice(at)) {
+    if (s.status !== 'completed') s.status = 'skipped';
+  }
+  const appended: TaskObjective[] = res.subObjectives.map((o, i) => ({ ...o, id: subs.length + i + 1 }));
+  subs.push(...appended);
+
+  tm.subObjectives = subs;
+  tm.planSource = res.source;
+  tm.replans = spent + 1;
+  tm.currentObjective = appended[0]?.description;
+  // The old plan's dead ends say nothing about the new plan's targets.
+  tm.attemptedTargets = [];
+  publishPlan(tm);
+
+  logger.info(
+    'plan',
+    `re-planned after ${reason} (${tm.replans}/${MAX_REPLANS})`,
+    appended.map((o) => o.description).join(' -> '),
+  );
+  return true;
+}
+
+/**
+ * Probe Nano and, if Chrome has not downloaded the weights yet, ask it to.
+ *
+ * Must be reached from a user gesture — see the WARM_UP handler. Failure is
+ * recorded in `status.nano` and nothing else: the run path treats a missing Nano
+ * as "use the rule-based splitter", not as an error.
+ */
+async function warmUpNano(): Promise<void> {
+  // `allowDownload` opens a session in the offscreen document, which is what
+  // makes Chrome fetch the weights; the router's own probe afterwards then sees
+  // 'available' rather than 'downloadable'.
+  const opened = await askOffscreen<{ probe: NanoProbe }>({ kind: 'NANO_PROBE', allowDownload: true });
+  nano.reset();
+  const route = await nano.route();
+  const probe = nano.status();
+  status.nano = { route, state: probe.state, reason: probe.reason };
+  logger.info('nano', `warm-up: route=${route} state=${probe.state}`, opened.ok ? probe.reason : opened.error);
+}
+
+/**
+ * The page the *first* decomposition gets to see.
+ *
+ * Optional on purpose: a blind decomposition is still useful, and a failed
+ * scrape here must not pre-empt the much better error message `step()` produces
+ * on the same failure one moment later.
+ */
+async function seedDom(tabId: number): Promise<ScrubbedDom | undefined> {
+  try {
+    return (await scrape(tabId, 2)).dom;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function runAgent(goal: string, tabId: number): Promise<void> {
   if (running) throw new Error('agent already running');
   const settings = await loadSettings();
@@ -660,11 +887,25 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
   status.step = 0;
   status.maxSteps = settings.maxSteps;
   status.lastError = undefined;
+  status.plan = undefined;
   const history: AgentAction[] = [];
 
   try {
-    // Decompose complex query using Chrome Built-in Gemini Nano or rule-based fallback
-    const plan = await decomposeGoal(goal);
+    // Stage A. Where Nano runs is resolved once per service-worker lifetime;
+    // logging it is the only way to tell "no Nano on this machine" apart from
+    // "Nano is there and the plan really is one step".
+    const route = await nano.route();
+    const probe = nano.status();
+    status.nano = { route, state: probe.state, reason: probe.reason };
+    logger.info(
+      'nano',
+      `sub-query engine ${route === 'none' ? 'unavailable' : `on ${route}`} (${probe.state}${probe.flavour !== 'none' ? `, ${probe.flavour}` : ''})`,
+      probe.reason,
+    );
+
+    // Sub-query the goal. Handing Nano the starting page lets step one name a
+    // control that exists instead of restating the goal back at us.
+    const plan = await nano.decompose(goal, await seedDom(tabId));
     const taskMemory: TaskMemory = {
       goal,
       subObjectives: plan.subObjectives,
@@ -672,12 +913,15 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
       currentObjective: plan.subObjectives[0]?.description,
       completedObjectives: [],
       attemptedTargets: [],
+      replans: 0,
       step: 0,
     };
+    publishPlan(taskMemory);
 
     logger.info(
       'plan',
-      `decomposed goal via ${plan.source} into ${plan.subObjectives.length} sub-objectives: ${plan.subObjectives.map((s) => s.description).join(' -> ')}`,
+      `decomposed goal via ${plan.source} into ${plan.subObjectives.length} sub-objectives`,
+      plan.subObjectives.map((s) => s.description).join(' -> '),
     );
 
     let prevDom: ScrubbedDom | undefined;
@@ -713,19 +957,10 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
       // prevDom for next step
       prevDom = result.postDom;
 
-      // If the model emitted done, check if there are subsequent sub-objectives
+      // A `done` here means the current *sub-objective* is finished, not the
+      // whole goal — so retire it and keep going while any remain.
       if (action.action === 'done') {
-        if (taskMemory.subObjectives && taskMemory.subObjectives.length > 0) {
-          const activeIndex = taskMemory.subObjectives.findIndex((s) => s.status === 'active');
-          if (activeIndex !== -1 && activeIndex + 1 < taskMemory.subObjectives.length) {
-            taskMemory.subObjectives[activeIndex].status = 'completed';
-            taskMemory.completedObjectives.push({ description: taskMemory.subObjectives[activeIndex].description, status: 'completed' });
-            taskMemory.subObjectives[activeIndex + 1].status = 'active';
-            taskMemory.currentObjective = taskMemory.subObjectives[activeIndex + 1].description;
-            logger.info('task', `sub-objective completed; advancing to [${activeIndex + 2}/${taskMemory.subObjectives.length}]: ${taskMemory.currentObjective}`);
-            continue;
-          }
-        }
+        if (advanceObjective(taskMemory, 'model emitted done')) continue;
         break;
       }
 
@@ -762,35 +997,18 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
 
       if (resultCategory === 'state_changed') {
         taskMemory.attemptedTargets = [];
-        
-        // Progress sub-objectives when verified
-        if (taskMemory.subObjectives && taskMemory.subObjectives.length > 0) {
-          const activeIndex = taskMemory.subObjectives.findIndex((s) => s.status === 'active');
-          if (activeIndex !== -1) {
-            const currentSub = taskMemory.subObjectives[activeIndex];
-            // Check if current sub-objective is fulfilled (explicitly or via sub-goal check)
-            const subSignal = checkTermination({
-              goal: currentSub.description,
-              dom: result.postDom,
-              lastAction: action,
-              prevDom: result.preDom,
-              history,
-            });
-            const isSubCompleted = Boolean(action.completedObjective) || (subSignal.done && subSignal.confidence >= HIGH_CONFIDENCE);
-            if (isSubCompleted) {
-              currentSub.status = 'completed';
-              taskMemory.completedObjectives.push({ description: currentSub.description, status: 'completed' });
-              logger.info('task', `completed sub-objective [${activeIndex + 1}/${taskMemory.subObjectives.length}]: ${currentSub.description}`);
 
-              const nextIndex = activeIndex + 1;
-              if (nextIndex < taskMemory.subObjectives.length) {
-                taskMemory.subObjectives[nextIndex].status = 'active';
-                taskMemory.currentObjective = taskMemory.subObjectives[nextIndex].description;
-                logger.info('task', `advancing to next sub-objective [${nextIndex + 1}/${taskMemory.subObjectives.length}]: ${taskMemory.currentObjective}`);
-              } else {
-                taskMemory.currentObjective = undefined;
-                logger.info('task', 'all sub-objectives finished');
-              }
+        if (taskMemory.subObjectives && taskMemory.subObjectives.length > 0) {
+          const current = taskMemory.subObjectives[activeIndexOf(taskMemory)];
+          if (current) {
+            const verdict = await subObjectiveSatisfied(current.description, action, result, history);
+            if (verdict.done && !advanceObjective(taskMemory, verdict.why)) {
+              // That was the last sub-objective, so the plan is finished by its
+              // own definition. Continuing would hand the vision tier an
+              // undefined objective and the raw compound goal, which is the
+              // thing the decomposition existed to avoid.
+              history.push({ action: 'done', summary: `all sub-objectives complete (${verdict.why})` });
+              break;
             }
           }
         } else {
@@ -807,33 +1025,38 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
         }
       }
 
-      if (action.action === 'invalid') {
-        invalidCount++;
-        if (invalidCount >= 3) {
-          logger.warn('agent', 'too many invalid actions; stopping');
-          break;
+      // --- Stall handling: re-plan before giving up ---------------------
+      //
+      // Each of the three conditions in `stallReason` used to end the run
+      // outright. They are all the same failure — the active sub-objective
+      // cannot be grounded on this page — and that is what Nano can fix, by
+      // re-saying the remaining work in terms of the elements that are actually
+      // here. The guards still stop the run; they just get one rewrite first.
+      if (action.action === 'invalid') invalidCount++;
+      else invalidCount = 0;
+
+      const stall = stallReason(action, resultCategory, isActionWaitOrDone, history, invalidCount);
+      if (stall) {
+        logger.warn('agent', `stalled: ${stall}`);
+        if (await tryReplan(taskMemory, result.postDom, history, stall)) {
+          // The rewritten plan makes loop detection misleading: the repeated
+          // action was aimed at a sub-objective that no longer exists.
+          history.length = 0;
+          invalidCount = 0;
+          continue;
         }
-      } else {
-        invalidCount = 0;
-      }
-
-      if (action.action !== 'invalid' && resultCategory === 'no_change' && !isActionWaitOrDone && repeatedTail(history) >= 2) {
-        logger.warn('agent', `action ${domFingerprint(action)} produced no state change; stopping to prevent loop`);
-        break;
-      }
-
-      // --- Existing consecutive-repeat emergency guard ------------------
-      if (repeatedTail(history) >= 3) {
-        logger.warn('agent', `same action ${domFingerprint(action)} three times; stopping`);
+        logger.warn('agent', 'no re-plan available; stopping');
         break;
       }
 
       // --- Structural stagnation guard ----------------------------------
       if (recordAndCheck(stagnation, prevDom, action, i)) {
-        logger.warn(
-          'agent',
-          `page stagnant at step ${i + 1} (${stagnation.totalNonWait} non-wait actions, no structural change); stopping`,
-        );
+        const why = `page stagnant (${stagnation.totalNonWait} non-wait actions, no structural change)`;
+        logger.warn('agent', `${why} at step ${i + 1}`);
+        if (await tryReplan(taskMemory, result.postDom, history, why)) {
+          history.length = 0;
+          continue;
+        }
         break;
       }
 
@@ -848,6 +1071,28 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
     status.running = false;
     ws?.close();
   }
+}
+
+/**
+ * Why this step counts as a stall, or undefined if it does not.
+ *
+ * Consolidates the three guards that previously ended a run independently, so
+ * the re-plan path has exactly one place to hook into and each guard's threshold
+ * stays where it was.
+ */
+function stallReason(
+  action: AgentAction,
+  result: ActionResultCategory,
+  isWaitOrEscalate: boolean,
+  history: readonly AgentAction[],
+  invalidCount: number,
+): string | undefined {
+  if (invalidCount >= 3) return 'three invalid actions in a row';
+  if (action.action !== 'invalid' && result === 'no_change' && !isWaitOrEscalate && repeatedTail(history) >= 2) {
+    return `${domFingerprint(action)} repeated with no state change`;
+  }
+  if (repeatedTail(history) >= 3) return `${domFingerprint(action)} chosen three times`;
+  return undefined;
 }
 
 function makeWsClient(settings: Settings): WsClient {
@@ -906,6 +1151,11 @@ chrome.runtime.onMessage.addListener((msg: Record<string, unknown>, _sender, sen
           // open message port. The popup polls `status` for progress.
           sendResponse({ ok: true, status });
           void warmUpLocalModel(settings, { force: true });
+          // This message originates from a popup click, so it carries the user
+          // gesture Chrome wants before it will fetch Gemini Nano's weights.
+          // Nowhere inside an agent run can supply that, which is why a
+          // 'downloadable' Nano is otherwise reported as simply unavailable.
+          void warmUpNano();
           return;
         }
         default:

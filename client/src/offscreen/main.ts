@@ -1,13 +1,31 @@
 /**
- * Offscreen host: bridges chrome.runtime messages to the WebGPU worker.
+ * Offscreen host: bridges chrome.runtime messages to the WebGPU worker, and
+ * hosts Gemini Nano.
  *
  * The service worker owns orchestration but cannot own a GPU context, and
  * ImageBitmaps cannot cross chrome.runtime — so frames arrive here as
  * base64 data URLs and are decoded locally before transfer to the worker.
+ *
+ * This document is also the only place in the extension where Chrome's built-in
+ * Prompt API exists: it is exposed to documents, not to workers, so the
+ * service worker's sub-query calls arrive here as `NANO_*` messages. Note the
+ * asymmetry with the VLM — Nano runs on *this* thread rather than in the worker,
+ * because the API is not exposed to web workers either.
  */
 import type { WorkerRequest, WorkerResponse } from '~/ai/vlm-worker';
 import { dataUrlToBitmap } from '~/privacy/canvas-redactor';
 import { newId, type AgentAction, type AgentDecision, type ScrubbedDom } from '@shared/types';
+import type { NanoMessageKind } from '~/ai/nano-bridge';
+import {
+  decomposeGoal,
+  nanoPlanner,
+  nanoStatus,
+  replanFromPage,
+  verifySubObjective,
+  type ReplanInput,
+  type VerifyInput,
+} from '~/ai/nano-query-planner';
+import { probeNano } from '~/ai/nano-session';
 
 const worker = new Worker(new URL('../ai/vlm-worker.ts', import.meta.url), { type: 'module' });
 
@@ -102,7 +120,7 @@ function ask<T extends WorkerResponse['type']>(
 
 export interface OffscreenInferRequest {
   target: 'offscreen';
-  kind: 'PROBE' | 'INIT' | 'INFER';
+  kind: 'PROBE' | 'INIT' | 'INFER' | NanoMessageKind;
   modelKey?: string;
   goal?: string;
   dom?: ScrubbedDom;
@@ -110,6 +128,10 @@ export interface OffscreenInferRequest {
   frameDataUrl?: string;
   history?: AgentAction[];
   taskMemory?: import('@shared/types').TaskMemory;
+  /** Payload for NANO_REPLAN / NANO_VERIFY, already JSON-round-tripped. */
+  input?: ReplanInput | VerifyInput;
+  /** NANO_PROBE only: create a session, downloading weights if Chrome needs to. */
+  allowDownload?: boolean;
 }
 
 chrome.runtime.onMessage.addListener((message: OffscreenInferRequest, _sender, sendResponse) => {
@@ -117,6 +139,37 @@ chrome.runtime.onMessage.addListener((message: OffscreenInferRequest, _sender, s
   void (async () => {
     try {
       switch (message.kind) {
+        /* ---- Gemini Nano sub-query engine ------------------------------ *
+         * These run on the document thread, not in the worker: the Prompt API
+         * is exposed to neither the service worker nor web workers. They are
+         * cheap (text-only, on-device) so they do not need the worker's
+         * isolation — but a slow generation does share this thread with the
+         * message pump, which is why every call in `nano-session` is bounded.
+         * ---------------------------------------------------------------- */
+        case 'NANO_PROBE': {
+          // `nanoPlanner` opens (and caches) the session so the first real
+          // query does not also pay session creation. With `allowDownload` the
+          // caller has a user gesture behind it and Chrome may fetch weights.
+          if (message.allowDownload) await nanoPlanner({ allowDownload: true });
+          const probe = message.allowDownload ? nanoStatus() : await probeNano();
+          sendResponse({ ok: true, probe });
+          return;
+        }
+        case 'NANO_DECOMPOSE': {
+          const plan = await decomposeGoal(message.goal ?? '', message.dom);
+          sendResponse({ ok: true, plan });
+          return;
+        }
+        case 'NANO_REPLAN': {
+          const result = await replanFromPage(message.input as ReplanInput);
+          sendResponse({ ok: true, result });
+          return;
+        }
+        case 'NANO_VERIFY': {
+          const result = await verifySubObjective(message.input as VerifyInput);
+          sendResponse({ ok: true, result });
+          return;
+        }
         case 'PROBE': {
           const r = await ask({ type: 'PROBE', id: newId() }, 'PROBE_RESULT', [], 10_000);
           sendResponse({ ok: true, webgpu: r.webgpu, adapter: r.adapter, reason: r.reason });

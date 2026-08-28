@@ -121,17 +121,27 @@ export interface AgentDecision {
 export interface TaskObjective {
   id?: number;
   description: string;
-  status: 'pending' | 'active' | 'completed';
+  /**
+   * `skipped` marks an objective a re-plan dropped: it is neither pending work
+   * nor an accomplishment, and the termination checker must not count it as
+   * either.
+   */
+  status: 'pending' | 'active' | 'completed' | 'skipped';
 }
 
 export type ActionResultCategory = 'state_changed' | 'no_change' | 'failed' | 'uncertain';
+
+/** Where a sub-objective plan came from. */
+export type PlanSource = 'gemini-nano' | 'gemini-nano-replan' | 'local-rules' | 'cloud';
 
 export interface TaskMemory {
   goal: string;
   currentObjective?: string;
   subObjectives?: TaskObjective[];
   completedObjectives: TaskObjective[];
-  planSource?: 'gemini-nano' | 'local-rules' | 'cloud';
+  planSource?: PlanSource;
+  /** How many times Nano rewrote the remaining plan this run. Bounded by the caller. */
+  replans?: number;
   lastAction?: {
     action: AgentAction;
     result: ActionResultCategory;
@@ -398,6 +408,22 @@ export interface AgentStatus {
   modelStage?: string;
   /** Why the local model failed to load, if it did. Survives past the log ring. */
   modelError?: string;
+  /**
+   * The Gemini Nano sub-query plan for this run, so the popup can show the
+   * checklist the agent is working through rather than just a step counter.
+   */
+  plan?: {
+    source: PlanSource;
+    objectives: TaskObjective[];
+    /** Times the plan was rewritten against a real page mid-run. */
+    replans: number;
+  };
+  /** Where the built-in Prompt API was found, and what state it is in. */
+  nano?: {
+    route: 'local' | 'offscreen' | 'none';
+    state: 'available' | 'downloadable' | 'downloading' | 'unavailable';
+    reason?: string;
+  };
   lastDecision?: AgentDecision;
   lastError?: string;
   escalations: number;

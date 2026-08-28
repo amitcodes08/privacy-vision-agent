@@ -2,7 +2,7 @@
 
 A client-dominant, privacy-preserving hybrid vision agent with hierarchical multi-step planning.
 
-1. **Client-Side Query Planning**: Chrome Built-in **Gemini Nano (`ai.languageModel`)** decomposes complex, multi-clause user goals into an ordered sequence of atomic sub-objectives (with zero-overhead offline linguistic fallback).
+1. **Client-Side Sub-Query Engine**: Chrome Built-in **Gemini Nano** (the `LanguageModel` Prompt API) sub-queries a complex goal into ordered atomic sub-objectives, **rewrites the remaining plan against the live page** when a sub-objective stalls, and verifies each one as it lands. Zero network, with a zero-overhead offline clause-splitting fallback.
 2. **On-Device Vision Grounding**: A quantized **SmolVLM-256M-Instruct** model runs **inside the browser on WebGPU** to visually ground and execute each atomic sub-objective with zero network calls.
 3. **Deterministic Ranker & Corroborator**: Grounds prompt element budgets and validates model intent against the active sub-goal.
 4. **Termination Safeguards**: Validates progress against the entire sub-objective plan, preventing premature termination on intermediate search results.
@@ -12,8 +12,9 @@ A client-dominant, privacy-preserving hybrid vision agent with hierarchical mult
                       User Goal (e.g. "Search for shoes and add to cart")
                                               │
                                               ▼
-                         [Gemini Nano / Query Decomposer]
-                                              │
+                    ┌──── Gemini Nano sub-query engine (offscreen doc) ─────┐
+                    │  decompose · replan-on-stall · verify sub-objective   │
+                    └──────────────────────────┬───────────────────────────┘
                                               ▼
                               Ordered Sub-Objectives Checklist
                                               │
@@ -40,17 +41,48 @@ captureVisibleTab ──raw frame──► offscreen ► WebGPU worker ► SmolV
                   {action, selector, valueType} ► local hydration ► action        (3: last resort)
                                      │
                                      ▼
-                      State Changed? Advance Sub-Objective ──► Repeat / Done
+         Sub-objective verified? Advance ──► Repeat / Done
+         Stalled instead?        Nano re-plans against this page ──► Repeat
 ```
 
-**The VLM is the planner for each atomic sub-goal.** The ranker never overrides a model that actually chose an element. Tier 3 (cloud escalation) acts strictly as a fallback when on-device models are unsure.
+**Two stages, answering different questions.** Nano decides *what* the current sub-goal is; it never picks an element and is not part of the escalation ladder. The VLM decides *how* to satisfy that sub-goal, and the ranker never overrides a model that actually chose an element. Tier 3 (cloud escalation) acts strictly as a fallback when on-device models are unsure.
+
+## Where Gemini Nano runs, and why it is not in the service worker
+
+Chrome exposes the Prompt API to **documents**, not to workers. The orchestrator lives in the
+service worker, so calling the planner from there probed a global that does not exist and every
+run silently fell back to clause splitting. The offscreen document is already in the build for the
+WebGPU worker and *is* a document, so Nano runs there and the service worker reaches it over the
+same `chrome.runtime` channel as the VLM. [nano-bridge.ts](client/src/ai/nano-bridge.ts) resolves
+that route once per service-worker lifetime — `local` (should Chrome ever expose the API to
+extension workers), `offscreen`, or `none` — and the popup shows which one won.
+
+Two more Chrome specifics are absorbed in [nano-session.ts](client/src/ai/nano-session.ts):
+the current `LanguageModel` global and the legacy `ai.languageModel` origin-trial shape are both
+probed (their availability vocabularies differ: `available`/`downloadable`/`unavailable` versus
+`readily`/`after-download`/`no`), and an extension session must pass **both** `topK` and
+`temperature` or neither, so the `topK` paired with our `temperature: 0` is read from `params()`.
+
+Weights download only from the popup's **Load model** button — Chrome wants a user gesture for it,
+and nothing inside an agent run can supply one. Until then Nano reports `downloadable` and the
+rule-based splitter handles decomposition.
+
+## What Nano is allowed to see
+
+Nano is on-device, so a planning query costs no network egress — but the digest it receives is
+still narrower than the scrubbed DOM the cloud tier would get. `digestPage()` emits the page
+**origin** (never the full URL, which can carry tokens), the title, and up to 24 visible element
+descriptions. It never emits a field `value`, even an unredacted one, and any node carrying a
+redaction reason is described by tag and role alone. Raw pixels never reach this path at all.
 
 ## Layout
 
 | Path | Role |
 | --- | --- |
 | [shared/types.ts](shared/types.ts) | Wire contract: actions, envelopes, scrubbed DOM, `TaskMemory` with sub-objectives |
-| [client/src/ai/nano-query-planner.ts](client/src/ai/nano-query-planner.ts) | Chrome Gemini Nano (`ai.languageModel`) query decomposer + rule-based fallback |
+| [client/src/ai/nano-session.ts](client/src/ai/nano-session.ts) | Chrome Prompt API adapter: both API generations, paired sampling, abortable calls |
+| [client/src/ai/nano-query-planner.ts](client/src/ai/nano-query-planner.ts) | Sub-query engine: decompose / replan / verify, page digest, rule-based fallback |
+| [client/src/ai/nano-bridge.ts](client/src/ai/nano-bridge.ts) | Routes sub-query work to the context that has the Prompt API |
 | [client/src/ai/termination-checker.ts](client/src/ai/termination-checker.ts) | Multi-step completion validator; guards against premature termination |
 | [client/src/content/dom-scrubber.ts](client/src/content/dom-scrubber.ts) | Page → `ScrubbedDom` + boxes to black out |
 | [client/src/privacy/pii-detector.ts](client/src/privacy/pii-detector.ts) | Luhn/Verhoeff-checked PII rules, deterministic |
@@ -219,7 +251,7 @@ fake socket rather than trusting the reading.
 ## Verification status
 
 ```
-client: 129 passed, 2 skipped  (vitest, jsdom)
+client: 181 passed, 2 skipped  (vitest, jsdom)
 server: 8 passed               (vitest)
 tsc --noEmit: clean in both workspaces
 vite build:   extension bundles; copy:ort vendors 20.6 MB of ORT WASM into dist/ort/
@@ -265,9 +297,24 @@ parseable action often enough to earn tier 1. That needs a manual pass.
   `value-hydrator.ts` **refuses** `USER_PASSWORD` and `OTP_CODE` outright, so
   a compromised server cannot make the extension type a credential.
 - `redactionSummary` gives the popup a per-run privacy receipt.
+- The Gemini Nano sub-query engine is on-device, so decomposition, re-planning,
+  and sub-objective verification add no network egress at all. What it is shown
+  is narrower than the escalation payload: origin only, no field values, and
+  redacted nodes reduced to tag + role. See *What Nano is allowed to see*.
 
 ## Known gaps
 
+- **The Nano sub-query path has not been exercised against a real Gemini Nano.**
+  Both API generations, the paired-sampling rule, the abort bound, and the
+  schema-rejection retry are unit-tested against fakes, and the routing
+  (service worker → offscreen document) is unit-tested — but no run has yet gone
+  through Chrome's actual `LanguageModel`. The failure mode to watch for is a
+  model that answers *plausibly but uselessly* ("Complete the task"), which
+  passes every parse check here and produces a plan the vision tier cannot
+  ground. That is what the re-plan budget bounds rather than prevents.
+- Re-planning is capped at 2 per run and each one clears `history`, so the
+  loop-detection guards start cold afterwards. A goal that needs a third rewrite
+  ends the run.
 - **No auth on the WebSocket.** The server binds to `127.0.0.1` for that
   reason. Add a shared-secret handshake before exposing it off-host.
 - Visual PII redaction is DOM-driven. Faces and PII baked into images are not

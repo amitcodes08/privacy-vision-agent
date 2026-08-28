@@ -89,6 +89,25 @@ button.wide { width: 100%; }
   transition: width 0.3s ease;
 }
 
+/* ---- sub-query plan checklist ---- */
+.plan {
+  list-style: none; margin: 0; padding: 6px 9px;
+  display: flex; flex-direction: column; gap: 3px;
+  background: var(--sunken); border: 1px solid var(--line); border-radius: 8px;
+  font-size: 11px; line-height: 1.35;
+}
+.plan li {
+  display: flex; gap: 6px; align-items: baseline;
+  color: var(--muted); word-break: break-word;
+}
+.plan .tick { flex: none; width: 9px; text-align: center; color: var(--faint); }
+.plan li[data-state='active'] { color: var(--text); font-weight: 500; }
+.plan li[data-state='active'] .tick { color: var(--accent); }
+.plan li[data-state='completed'] { color: var(--faint); }
+.plan li[data-state='completed'] .tick { color: var(--ok); }
+/* superseded by a re-plan: kept visible so the rewrite is legible, but muted */
+.plan li[data-state='skipped'] { color: var(--faint); text-decoration: line-through; }
+
 /* ---- alert ---- */
 .alert {
   font-size: 11px; line-height: 1.4; color: #fca5a5;

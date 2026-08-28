@@ -103,7 +103,9 @@ function _check(input: CheckInput): TerminationSignal {
 
   // Multi-step safety: if there are pending sub-objectives, the overarching task cannot be complete
   if (taskMemory?.subObjectives && taskMemory.subObjectives.length > 1) {
-    const pending = taskMemory.subObjectives.filter((s) => s.status !== 'completed');
+    // `skipped` objectives were dropped by a re-plan — they are not outstanding
+    // work, so counting them here would keep the run alive forever.
+    const pending = taskMemory.subObjectives.filter((s) => s.status === 'pending' || s.status === 'active');
     if (pending.length > 0) {
       return NOT_DONE(`${pending.length} sub-objectives still pending`);
     }

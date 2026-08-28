@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ChevronDown, Cpu, Play, Server, Settings2, ShieldCheck, Square, Terminal } from 'lucide-react';
+import { ChevronDown, Cpu, ListChecks, Play, Server, Settings2, ShieldCheck, Square, Terminal } from 'lucide-react';
 import type { AgentLogEntry, AgentStatus } from '@shared/types';
 import { loadSettings, saveSettings, type Settings } from '~/lib/settings';
 
@@ -80,6 +80,24 @@ export default function App() {
     return { label: 'on-device planner', tone: 'warn' as const };
   }, [status]);
 
+  /**
+   * How the goal got sub-queried. Worth its own line: a one-step plan from
+   * clause splitting and a one-step plan from Gemini Nano look identical in the
+   * step counter but mean very different things when a run goes wrong.
+   */
+  const planner = useMemo(() => {
+    const nano = status?.nano;
+    if (!nano || nano.route === 'none') {
+      return { label: 'rule-based sub-query', tone: 'warn' as const, title: nano?.reason ?? 'Chrome built-in AI not available here' };
+    }
+    if (nano.state !== 'available') {
+      return { label: `Gemini Nano ${nano.state}`, tone: 'busy' as const, title: nano.reason ?? 'model not ready yet' };
+    }
+    return { label: 'Gemini Nano sub-query', tone: 'ok' as const, title: `Prompt API on the ${nano.route} context` };
+  }, [status]);
+
+  const plan = status?.plan;
+
   const problem = errorMsg ?? status?.lastError ?? status?.modelError;
   const acted = (status?.localDecisions ?? 0) + (status?.heuristicDecisions ?? 0);
   const escalated = status?.escalations ?? 0;
@@ -133,6 +151,29 @@ export default function App() {
           </span>
         )}
       </div>
+
+      <div className="engine" data-tone={planner.tone} title={planner.title}>
+        <ListChecks size={12} />
+        <span>{planner.label}</span>
+        {plan && plan.replans > 0 && (
+          <span className="tally" title="Times the plan was rewritten against the live page">
+            {plan.replans} re-plan{plan.replans > 1 ? 's' : ''}
+          </span>
+        )}
+      </div>
+
+      {plan && plan.objectives.length > 0 && (
+        <ol className="plan">
+          {plan.objectives.map((o, i) => (
+            <li key={`${o.id ?? i}-${o.description}`} data-state={o.status}>
+              <span className="tick">
+                {o.status === 'completed' ? '✓' : o.status === 'skipped' ? '–' : o.status === 'active' ? '▸' : '·'}
+              </span>
+              {o.description}
+            </li>
+          ))}
+        </ol>
+      )}
 
       {problem && <div className="alert">{problem}</div>}
 
