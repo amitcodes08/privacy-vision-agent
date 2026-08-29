@@ -107,9 +107,11 @@ export type AgentAction =
 /** An action plus the metadata used by the escalation gate. */
 export interface AgentDecision {
   action: AgentAction;
+  /** Optional sequence of batched macro actions to execute consecutively. */
+  macroActions?: AgentAction[];
   /** 0..1 — below `confidenceThreshold` triggers escalation. */
   confidence: number;
-  source: 'local' | 'cloud' | 'heuristic';
+  source: 'local' | 'cloud' | 'heuristic' | 'cache';
   latencyMs?: number;
   modelId?: string;
 }
@@ -502,6 +504,8 @@ export interface AgentStatus {
   localDecisions: number;
   /** Actions decided by the on-device deterministic planner (no network). */
   heuristicDecisions: number;
+  cacheHits?: number;
+  macroBatchesExecuted?: number;
   redactions: number;
 }
 

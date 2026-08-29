@@ -161,9 +161,18 @@ export function planLocally(input: PlanInput): AgentDecision {
     };
   }
 
+  const act = toAction(best.node, input.goal, ranking);
+  const conf = scoreToConfidence(best.score, ranking.breadth);
+  let macroActions: AgentAction[] | undefined;
+
+  if (act.action === 'fill' && act.submit) {
+    macroActions = [act];
+  }
+
   return {
-    action: toAction(best.node, input.goal, ranking),
-    confidence: scoreToConfidence(best.score, ranking.breadth),
+    action: act,
+    macroActions,
+    confidence: conf,
     source: 'heuristic',
   };
 }

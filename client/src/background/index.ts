@@ -41,6 +41,7 @@ import { makeStagnationState, recordAndCheck, fingerprint } from '~/ai/stagnatio
 import { sanitiseCloudAction } from '~/ai/decision-parser';
 import { createNanoRouter } from '~/ai/nano-bridge';
 import type { NanoProbe } from '~/ai/nano-session';
+import { globalActionCache } from '~/ai/action-cache';
 
 const OFFSCREEN_PATH = 'src/offscreen/index.html';
 
@@ -71,6 +72,8 @@ const status: AgentStatus = {
   escalations: 0,
   localDecisions: 0,
   heuristicDecisions: 0,
+  cacheHits: 0,
+  macroBatchesExecuted: 0,
   redactions: 0,
 };
 
@@ -293,6 +296,13 @@ async function execute(tabId: number, action: AgentAction): Promise<{ ok: boolea
   return res?.ok ? { ok: true } : { ok: false, error: res?.ok === false ? res.error : 'no response' };
 }
 
+async function executeBatch(tabId: number, actions: AgentAction[]): Promise<{ ok: boolean; error?: string }> {
+  const res = (await chrome.tabs.sendMessage(tabId, { kind: 'EXECUTE_BATCH', actions })) as OffscreenReply<{
+    detail?: string;
+  }>;
+  return res?.ok ? { ok: true } : { ok: false, error: res?.ok === false ? res.error : 'no response' };
+}
+
 /* ---------------------------------------------------------------- *
  * Frame capture
  * ---------------------------------------------------------------- */
@@ -377,6 +387,34 @@ interface StepResult {
 async function step(tabId: number, goal: string, history: AgentAction[], settings: Settings, taskMemory: TaskMemory): Promise<StepResult> {
   const { dom, boxes, dpr } = await scrape(tabId);
   status.redactions += boxes.length;
+
+  const currentTab = await chrome.tabs.get(tabId).catch(() => null);
+  const origin = currentTab?.url ? new URL(currentTab.url).origin : '';
+  const currentObj = taskMemory?.currentObjective || goal;
+
+  // --- Path 0A: Action Cache (Zero model latency, zero network) -----
+  if (origin) {
+    const cached = globalActionCache.get(origin, currentObj, dom);
+    if (cached) {
+      logger.info('cache', `hit for "${currentObj}" at ${origin} (${cached.action.action})`);
+      status.cacheHits = (status.cacheHits ?? 0) + 1;
+      const applied = await applyDecision(tabId, cached, dom);
+      return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom, observed: applied.observed, tabId: applied.tabId };
+    }
+  }
+
+  // --- Path 0B: Visual Bypass Fast-Path (High confidence heuristic, no frame capture) ---
+  const fastHeuristic = planLocally({ goal, dom, history, taskMemory });
+  if (fastHeuristic && fastHeuristic.confidence >= 0.90 && fastHeuristic.action.action !== 'escalate' && fastHeuristic.action.action !== 'done') {
+    logger.info('planner', `visual bypass fast-path: ${fastHeuristic.action.action} conf=${fastHeuristic.confidence.toFixed(2)}`);
+    status.heuristicDecisions++;
+    const applied = await applyDecision(tabId, fastHeuristic, dom);
+    if (origin && applied.action.action !== 'invalid') {
+      globalActionCache.set(origin, currentObj, dom, fastHeuristic.macroActions || [applied.action], fastHeuristic.confidence);
+    }
+    return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom, observed: applied.observed, tabId: applied.tabId };
+  }
+
   const frame = frameOnce();
 
   // --- Path 1: local VLM, unredacted, zero network ----------------
@@ -652,6 +690,23 @@ async function applyDecision(
     }
   }
 
+  if (decision.macroActions && decision.macroActions.length > 1) {
+    logger.info('execute', `executing ${decision.macroActions.length} macro actions`);
+    const batchRes = await executeBatch(tabId, decision.macroActions);
+    if (batchRes.ok) {
+      status.macroBatchesExecuted = (status.macroBatchesExecuted ?? 0) + 1;
+      await chrome.tabs.sendMessage(tabId, { kind: 'WAIT_FOR_SETTLED', timeoutMs: 400 }).catch(() => null);
+      const postScrape = await scrape(tabId).catch(() => null);
+      return {
+        action: decision.macroActions[decision.macroActions.length - 1],
+        preDom: immediatePreDom,
+        postDom: postScrape?.dom ?? immediatePreDom,
+        observed: true,
+        tabId,
+      };
+    }
+  }
+
   const res = await execute(tabId, action);
   if (!res.ok) {
     logger.warn('execute', `${action.action} failed`, res.error);
@@ -659,7 +714,7 @@ async function applyDecision(
   }
 
   // Adaptive settlement for state-changing actions
-  await sleep(150);
+  await chrome.tabs.sendMessage(tabId, { kind: 'WAIT_FOR_SETTLED', timeoutMs: 400 }).catch(() => null);
 
   // Check if a new tab was opened (e.g. via target="_blank" or window.open)
   let workingTabId = tabId;

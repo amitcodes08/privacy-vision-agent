@@ -12,7 +12,7 @@ import { hydrate } from './value-hydrator';
 
 let lastIndex = new Map<string, Element>();
 
-chrome.runtime.onMessage.addListener((msg: { kind?: string; action?: AgentAction }, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg: { kind?: string; action?: AgentAction; actions?: AgentAction[]; timeoutMs?: number }, _sender, sendResponse) => {
   void (async () => {
     try {
       if (msg?.kind === 'PING') {
@@ -35,6 +35,20 @@ chrome.runtime.onMessage.addListener((msg: { kind?: string; action?: AgentAction
         sendResponse({ ok: true, detail });
         return;
       }
+      if (msg?.kind === 'EXECUTE_BATCH' && msg.actions && msg.actions.length > 0) {
+        const details: string[] = [];
+        for (const act of msg.actions) {
+          const detail = await perform(act);
+          details.push(detail);
+        }
+        sendResponse({ ok: true, detail: details.join('; ') });
+        return;
+      }
+      if (msg?.kind === 'WAIT_FOR_SETTLED') {
+        await waitForDomSettled(msg.timeoutMs ?? 1000);
+        sendResponse({ ok: true });
+        return;
+      }
       sendResponse({ ok: false, error: `unhandled message ${String(msg?.kind)}` });
     } catch (err) {
       sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) });
@@ -42,6 +56,42 @@ chrome.runtime.onMessage.addListener((msg: { kind?: string; action?: AgentAction
   })();
   return true;
 });
+
+function waitForDomSettled(maxTimeoutMs = 1000, idleDelayMs = 80): Promise<void> {
+  return new Promise((resolve) => {
+    let timer: ReturnType<typeof setTimeout>;
+
+    const done = () => {
+      observer.disconnect();
+      clearTimeout(timer);
+      resolve();
+    };
+
+    const resetTimer = () => {
+      clearTimeout(timer);
+      timer = setTimeout(done, idleDelayMs);
+    };
+
+    const observer = new MutationObserver(() => {
+      resetTimer();
+    });
+
+    try {
+      observer.observe(document.body || document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        characterData: true,
+      });
+    } catch {
+      done();
+      return;
+    }
+
+    setTimeout(done, maxTimeoutMs);
+    resetTimer();
+  });
+}
 
 function resolve(selector: string): HTMLElement {
   const cached = lastIndex.get(selector);

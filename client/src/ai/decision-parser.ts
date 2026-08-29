@@ -194,37 +194,45 @@ export interface ParseContext {
  * The score is structural, not probabilistic: an element that does not exist
  * on the page is worthless no matter how confident the logits were.
  */
-export function parseAction(
+export const parseAction = parseDecision;
+
+export function parseDecision(
   raw: string,
   dom: ScrubbedDom,
   ctx: ParseContext = {},
-): { action: AgentAction; confidence: number } {
+): { action: AgentAction; confidence: number; macroActions?: AgentAction[] } {
   const json = extractJson(raw);
   if (!json || typeof json !== 'object') {
-    // Before giving up, check whether the raw text is a strong explicit completion statement.
     if (parseDoneFromText(raw)) {
-      // Confidence 0.65: above the confidence threshold so the decision is
-      // treated as usable (not vlmUnusable), but below HIGH_CONFIDENCE so it
-      // still requires DOM corroboration before the loop stops unconditionally.
       return { action: { action: 'done', summary: raw.trim().slice(0, 200) }, confidence: 0.65 };
     }
-    // DO NOT emit `escalate` as a generic "I don't know".
-    // Unparseable output should result in an invalid action (confidence 0) so the planner can take over.
     return { action: { action: 'invalid', reason: `no JSON in local output (output: "${raw.trim().slice(0, 100)}")` }, confidence: 0 };
   }
 
-  const { action, match } = normalize(json as Record<string, unknown>, dom);
+  const jsonObj = json as Record<string, unknown>;
+  const { action, match } = normalize(jsonObj, dom);
   if (!action) {
-    const attempted = (json as any).action || 'unknown';
+    const attempted = (jsonObj as any).action || 'unknown';
     return { action: { action: 'invalid', reason: `invalid action emitted: "${attempted}"` }, confidence: 0 };
   }
+
+  let macroActions: AgentAction[] | undefined;
+  if (Array.isArray(jsonObj.macroActions) || Array.isArray(jsonObj.actions)) {
+    const rawList = (jsonObj.macroActions || jsonObj.actions) as Record<string, unknown>[];
+    const parsedList: AgentAction[] = [];
+    for (const item of rawList) {
+      const { action: act } = normalize(item, dom);
+      if (act && act.action !== 'invalid') parsedList.push(act);
+    }
+    if (parsedList.length > 0) macroActions = parsedList;
+  }
+
   if (action.action === 'escalate') return { action, confidence: 0 };
   if (action.action === 'done') return { action, confidence: 0.7 };
   if (action.action === 'wait') return { action, confidence: 0.6 };
   if (action.action === 'navigate') return { action, confidence: 0.6 };
   if (action.action === 'scroll' && !action.selector) return { action, confidence: 0.65 };
   if (action.action === 'invalid') return { action, confidence: 0 };
-
 
   let confidence = 0.55;
   if (match === 'exact') confidence += 0.32;
@@ -234,11 +242,6 @@ export function parseAction(
   if (node?.disabled) confidence -= 0.25;
   if (action.action === 'fill' && !action.valueType) confidence -= 0.2;
 
-  // Corroboration: the keyword ranker looked at the same page independently.
-  // When it would have picked the same element, that is real evidence the
-  // model read the page rather than guessing — and it is what keeps a correct
-  // but hesitant local decision from becoming a network round trip. The model
-  // still chose; this only vouches for the choice.
   if (ctx.goal && node) {
     const ranking = ctx.ranking ?? rankCandidates({ goal: ctx.goal, dom, history: ctx.history ?? [] });
     const at = rankOf(ranking, node.selector);
@@ -246,7 +249,11 @@ export function parseAction(
     else if (at !== undefined && at < 5) confidence += 0.06;
   }
 
-  return { action, confidence: Math.max(0, Math.min(1, confidence)) };
+  return {
+    action,
+    confidence: Math.max(0, Math.min(1, confidence)),
+    ...(macroActions ? { macroActions } : {}),
+  };
 }
 
 /**
