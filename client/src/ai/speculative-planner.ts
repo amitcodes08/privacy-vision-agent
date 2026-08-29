@@ -9,7 +9,7 @@
  * action completes without navigating to an entirely new page, the pre-grounded
  * speculative action can be dispatched immediately with zero model latency.
  */
-import type { AgentAction, AgentDecision, ScrubbedDom, TaskMemory, TaskObjective } from '@shared/types';
+import type { AgentAction, AgentDecision, ScrubbedDom, TaskMemory } from '@shared/types';
 import { planLocally } from './local-planner';
 import { globalActionCache } from './action-cache';
 

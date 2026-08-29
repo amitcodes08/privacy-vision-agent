@@ -4,8 +4,15 @@ import type { ScrubbedDom, TaskMemory } from '@shared/types';
 
 const mockDom: ScrubbedDom = {
   url: 'https://store.example.com/checkout',
+  origin: 'https://store.example.com',
   title: 'Checkout Page',
-  viewport: { width: 1280, height: 720 },
+  redactionSummary: {},
+  viewport: {
+  width: 1280,
+  height: 720,
+  scrollX: 0,
+  scrollY: 0,
+},
   nodes: [
     {
       id: 1,

@@ -707,17 +707,29 @@ async function applyDecision(
     logger.info('execute', `executing ${decision.macroActions.length} macro actions`);
     const batchRes = await executeBatch(tabId, decision.macroActions);
     if (batchRes.ok) {
-      status.macroBatchesExecuted = (status.macroBatchesExecuted ?? 0) + 1;
-      await chrome.tabs.sendMessage(tabId, { kind: 'WAIT_FOR_SETTLED', timeoutMs: 400 }).catch(() => null);
-      const postScrape = await scrape(tabId).catch(() => null);
-      return {
-        action: decision.macroActions[decision.macroActions.length - 1],
-        preDom: immediatePreDom,
-        postDom: postScrape?.dom ?? immediatePreDom,
-        observed: true,
-        tabId,
-      };
-    }
+  status.macroBatchesExecuted = (status.macroBatchesExecuted ?? 0) + 1;
+  await chrome.tabs.sendMessage(tabId, { kind: 'WAIT_FOR_SETTLED', timeoutMs: 400 }).catch(() => null);
+  const postScrape = await scrape(tabId).catch(() => null);
+
+  const lastMacroAction = decision.macroActions.at(-1);
+  if (!lastMacroAction) {
+    return {
+      action: { action: 'invalid', reason: 'macro execution succeeded but produced no actions' },
+      preDom: immediatePreDom,
+      postDom: postScrape?.dom ?? immediatePreDom,
+      observed: true,
+      tabId,
+    };
+  }
+
+  return {
+    action: lastMacroAction,
+    preDom: immediatePreDom,
+    postDom: postScrape?.dom ?? immediatePreDom,
+    observed: true,
+    tabId,
+  };
+}
   }
 
   const res = await execute(tabId, action);
