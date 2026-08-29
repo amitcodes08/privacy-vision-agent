@@ -3,10 +3,13 @@
 A client-dominant, privacy-preserving hybrid vision agent with hierarchical multi-step planning.
 
 1. **Client-Side Sub-Query Engine**: Chrome Built-in **Gemini Nano** (the `LanguageModel` Prompt API) sub-queries a complex goal into ordered atomic sub-objectives, **rewrites the remaining plan against the live page** when a sub-objective stalls, and verifies each one as it lands. Zero network, with a zero-overhead offline clause-splitting fallback.
-2. **On-Device Vision Grounding**: A quantized **SmolVLM-256M-Instruct** model runs **inside the browser on WebGPU** to visually ground and execute each atomic sub-objective with zero network calls.
-3. **Deterministic Ranker & Corroborator**: Grounds prompt element budgets and validates model intent against the active sub-goal.
-4. **Termination Safeguards**: Validates progress against the entire sub-objective plan, preventing premature termination on intermediate search results.
-5. **Redacted Cloud Escalation**: When the local model produces nothing usable, the extension escalates by sending a **redacted** screenshot (PII blacked out) plus a **scrubbed** DOM to a WebSocket server, which returns a structural command re-hydrated locally.
+2. **Action & Selector Resolution Cache (`ActionCache`)**: Fast structural DOM fingerprinting caches verified target selectors and sub-goal execution plans, skipping model calls on recurring page flows (inspired by Stagehand & Midscene.js).
+3. **Multi-Action Macro Execution**: Generates and dispatches ordered action sequences (`fill` + `submit`) in a single execution pass without multi-roundtrip model delays.
+4. **Visual Bypass & Event-Driven DOM Settlement**: High-confidence heuristic decisions skip frame capture to bypass Chrome's 2 FPS tab capture limit, while `MutationObserver` replaces static sleep delays with instant DOM readiness notifications.
+5. **On-Device Vision Grounding**: A quantized **SmolVLM-256M-Instruct** model runs **inside the browser on WebGPU** to visually ground and execute atomic sub-objectives with zero network calls.
+6. **Deterministic Ranker & Corroborator**: Grounds prompt element budgets and validates model intent against the active sub-goal.
+7. **Termination Safeguards**: Validates progress against the entire sub-objective plan, preventing premature termination on intermediate search results.
+8. **Redacted Cloud Escalation**: When the local model produces nothing usable, the extension escalates by sending a **redacted** screenshot (PII blacked out) plus a **scrubbed** DOM to a WebSocket server, which returns a structural command re-hydrated locally.
 
 ```
                       User Goal (e.g. "Search for shoes and add to cart")
@@ -20,17 +23,22 @@ A client-dominant, privacy-preserving hybrid vision agent with hierarchical mult
                                               │
 content script ──scrubbed DOM + sensitive boxes──┤
                                               ▼
+               ┌──────────────── ActionCache & Visual Bypass ─────────────────┐
+               │ Match origin + objective + DOM fingerprint?   ► Cached Action│ (0A: instant local)
+               │ High-confidence heuristic match (>=0.90)?     ► Direct Action│ (0B: zero frame capture)
+               └────────────────────────────────┬─────────────────────────────┘
+                                              ▼
                            keyword ranker ──grounds active sub-goal──┐
                                      │                               ▼
 captureVisibleTab ──raw frame──► offscreen ► WebGPU worker ► SmolVLM-256M plans action
                                                                 │
                                            ranker corroborates ─┤   (agreement raises confidence)
                                                                 ▼
-                                                              action              (1: local, no network)
+                                                       macro/single action (1: local, no network)
                                      │
                         no usable model output
                                      ▼
-                         ranker plans it instead ──► action                       (2: local, no network)
+                         ranker plans it instead ──► action                (2: local, no network)
                                      │
                          VLM unsure about a real element
                                      ▼
@@ -38,7 +46,7 @@ captureVisibleTab ──raw frame──► offscreen ► WebGPU worker ► SmolV
                                      ▼
                       ws://localhost:8080 ► cloud VLM (Gemini / Ollama)
                                      ▼
-                  {action, selector, valueType} ► local hydration ► action        (3: last resort)
+                   {action, selector, valueType} ► local hydration ► action (3: last resort)
                                      │
                                      ▼
          Sub-objective verified? Advance ──► Repeat / Done
@@ -79,23 +87,26 @@ redaction reason is described by tag and role alone. Raw pixels never reach this
 
 | Path | Role |
 | --- | --- |
-| [shared/types.ts](shared/types.ts) | Wire contract: actions, envelopes, scrubbed DOM, `TaskMemory` with sub-objectives |
+| [shared/types.ts](shared/types.ts) | Wire contract: actions, macro sequences, envelopes, scrubbed DOM, `TaskMemory` |
+| [client/src/ai/action-cache.ts](client/src/ai/action-cache.ts) | Structural DOM fingerprinting & action resolution cache |
+| [client/src/ai/speculative-planner.ts](client/src/ai/speculative-planner.ts) | Speculative sub-query pre-grounding pipeline (zero-latency multi-step execution) |
 | [client/src/ai/nano-session.ts](client/src/ai/nano-session.ts) | Chrome Prompt API adapter: both API generations, paired sampling, abortable calls |
 | [client/src/ai/nano-query-planner.ts](client/src/ai/nano-query-planner.ts) | Sub-query engine: decompose / replan / verify, page digest, rule-based fallback |
 | [client/src/ai/nano-bridge.ts](client/src/ai/nano-bridge.ts) | Routes sub-query work to the context that has the Prompt API |
 | [client/src/ai/termination-checker.ts](client/src/ai/termination-checker.ts) | Multi-step completion validator; guards against premature termination |
 | [client/src/content/dom-scrubber.ts](client/src/content/dom-scrubber.ts) | Page → `ScrubbedDom` + boxes to black out |
+| [client/src/content/index.ts](client/src/content/index.ts) | Content script: `EXECUTE`, `EXECUTE_BATCH`, and `WAIT_FOR_SETTLED` mutation observer |
 | [client/src/privacy/pii-detector.ts](client/src/privacy/pii-detector.ts) | Luhn/Verhoeff-checked PII rules, deterministic |
 | [client/src/privacy/canvas-redactor.ts](client/src/privacy/canvas-redactor.ts) | Destructive box painting → JPEG base64 |
 | [client/src/ai/models.ts](client/src/ai/models.ts) | Model catalogue (`SmolVLM-256M` default) + **per-graph** quantization |
 | [client/src/ai/model-loader.ts](client/src/ai/model-loader.ts) | Transformers.js v3 load + generate |
 | [client/src/ai/ort-assets.ts](client/src/ai/ort-assets.ts) | Where onnxruntime may load WASM from, and in which shape |
-| [client/src/ai/decision-parser.ts](client/src/ai/decision-parser.ts) | Prompt building, model text → action, selector repair + confidence |
-| [client/src/ai/local-planner.ts](client/src/ai/local-planner.ts) | Keyword ranker: grounds active sub-goal in prompt and corroborates |
+| [client/src/ai/decision-parser.ts](client/src/ai/decision-parser.ts) | Prompt building, model text → action, macro extraction, confidence scoring |
+| [client/src/ai/local-planner.ts](client/src/ai/local-planner.ts) | Keyword ranker: grounds active sub-goal, plans macro sequences, visual bypass |
 | [client/src/ai/vlm-worker.ts](client/src/ai/vlm-worker.ts) | Worker that owns the WebGPU context and weights |
 | [client/scripts/copy-ort.mjs](client/scripts/copy-ort.mjs) | Vendors onnxruntime's WASM so MV3 never fetches code remotely |
 | [client/src/offscreen/main.ts](client/src/offscreen/main.ts) | Offscreen host — the SW cannot own a GPU context |
-| [client/src/background/index.ts](client/src/background/index.ts) | Orchestrator: query planning, sub-objective progression, escalation ladder |
+| [client/src/background/index.ts](client/src/background/index.ts) | Orchestrator: sub-query planning, action caching, visual bypass, macro execution |
 | [client/src/network/ws-client.ts](client/src/network/ws-client.ts) | One socket, bounded reconnect ladder, request correlation |
 | [client/src/content/value-hydrator.ts](client/src/content/value-hydrator.ts) | Resolves `USER_EMAIL` etc. from local storage |
 | [server/src/websocket/handler.ts](server/src/websocket/handler.ts) | Envelope validation, rate limit, latency budget |

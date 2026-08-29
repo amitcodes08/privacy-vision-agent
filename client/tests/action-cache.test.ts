@@ -4,8 +4,10 @@ import type { ScrubbedDom } from '@shared/types';
 
 const mockDom: ScrubbedDom = {
   url: 'https://example.com/search',
+  origin: 'https://example.com',
   title: 'Test Page',
-  viewport: { width: 1280, height: 720 },
+  viewport: { width: 1280, height: 720, scrollX: 0, scrollY: 0 },
+  redactionSummary: {},
   nodes: [
     {
       id: 1,

@@ -5,7 +5,7 @@
  * Fast structural DOM fingerprinting allows repeating verified action sequences
  * without re-querying models or sending network requests when navigating familiar page structures.
  */
-import type { AgentAction, AgentDecision, ScrubbedDom, ScrubbedNode } from '@shared/types';
+import type { AgentAction, AgentDecision, ScrubbedDom} from '@shared/types';
 
 export interface CacheEntry {
   actions: AgentAction[];
@@ -65,9 +65,12 @@ export class ActionCache {
       return null;
     }
 
+    const [firstAction] = match.actions;
+    if (!firstAction) return null;
+
     this.hits++;
     return {
-      action: match.actions[0],
+      action: firstAction,
       macroActions: match.actions.length > 1 ? match.actions : undefined,
       confidence: match.confidence,
       source: 'cache',
