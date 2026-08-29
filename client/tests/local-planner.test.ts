@@ -237,3 +237,347 @@ describe('rankCandidates', () => {
   });
 });
 
+/* ------------------------------------------------------------------ *
+ * REGRESSION: compound NL instructions — search value extraction
+ *
+ * Root cause (fixed): planLocally called toAction(node, input.goal, ranking),
+ * where input.goal is the FULL original user instruction. When a compound
+ * instruction like "find the search box and search for gaming laptops" was
+ * decomposed into sub-objectives, the active objective "Search for gaming
+ * laptops" was used correctly for element ranking (via rankCandidates) but
+ * the fill VALUE was extracted from the original phrase, yielding:
+ *   "the search box and search for gaming laptops"
+ * instead of:
+ *   "gaming laptops"
+ *
+ * Fix: planLocally now derives effectiveGoal = currentObjective || goal and
+ * passes that to toAction, matching the behaviour already in rankCandidates.
+ * ------------------------------------------------------------------ */
+
+const SEARCH_DOM = dom([
+  node({
+    id: 0,
+    selector: '#q',
+    tag: 'input',
+    type: 'search',
+    role: 'searchbox',
+    placeholder: 'Search',
+    label: 'Search',
+  }),
+  node({ id: 1, selector: '#submit', tag: 'button', text: 'Search' }),
+]);
+
+/** Helper: make TaskMemory with a given active objective. */
+function taskMem(currentObjective: string): import('@shared/types').TaskMemory {
+  return {
+    goal: 'irrelevant original goal',
+    currentObjective,
+    subObjectives: [{ id: 1, description: currentObjective, status: 'active' }],
+    completedObjectives: [],
+    attemptedTargets: [],
+    replans: 0,
+    step: 1,
+  };
+}
+
+describe('planLocally — compound NL instruction regression', () => {
+
+  // Prompt 1: simple — should work (baseline)
+  it('P1: "search laptops" — simple goal produces value "laptops"', () => {
+    const d = planLocally({ goal: 'search laptops', dom: SEARCH_DOM });
+    expect(d.action.action).toBe('fill');
+    if (d.action.action === 'fill') {
+      expect(d.action.value).toBe('laptops');
+    }
+  });
+
+  // Prompt 2: simple search — should work (baseline)
+  it('P2: "search for gaming laptops" — produces value "gaming laptops"', () => {
+    const d = planLocally({ goal: 'search for gaming laptops', dom: SEARCH_DOM });
+    expect(d.action.action).toBe('fill');
+    if (d.action.action === 'fill') {
+      expect(d.action.value).toBe('gaming laptops');
+    }
+  });
+
+  // Prompt 4: compound — when decomposed, objective 2 is "Search laptops"
+  it('P4: compound "find search box and search laptops" — with active objective "Search laptops", value is "laptops" not the whole phrase', () => {
+    const originalGoal = 'find search box and search laptops';
+    const activeObjective = 'Search laptops';
+
+    const d = planLocally({
+      goal: originalGoal,
+      dom: SEARCH_DOM,
+      taskMemory: taskMem(activeObjective),
+    });
+
+    expect(d.action.action).toBe('fill');
+    if (d.action.action === 'fill') {
+      // Must NOT contain the original compound phrase
+      expect(d.action.value).not.toContain('search box');
+      expect(d.action.value).toBe('laptops');
+    }
+  });
+
+  // Prompt 5: the canonical failing case from the bug report
+  it('P5: compound "find the search box and search for gaming laptops" — with active objective "Search for gaming laptops", value is "gaming laptops"', () => {
+    const originalGoal = 'find the search box and search for gaming laptops';
+    const activeObjective = 'Search for gaming laptops';
+
+    const d = planLocally({
+      goal: originalGoal,
+      dom: SEARCH_DOM,
+      taskMemory: taskMem(activeObjective),
+    });
+
+    expect(d.action.action).toBe('fill');
+    if (d.action.action === 'fill') {
+      expect(d.action.value).toBe('gaming laptops');
+      // Ensure the full compound phrase is NOT used as the search value
+      expect(d.action.value).not.toContain('search box');
+      expect(d.action.value).not.toContain('find');
+    }
+  });
+
+  // Prompt 6: compound with three clauses
+  it('P6: compound with three clauses — active objective "Search for gaming laptops" yields value "gaming laptops"', () => {
+    const d = planLocally({
+      goal: 'find the search box and search for gaming laptops and open the first result',
+      dom: SEARCH_DOM,
+      taskMemory: taskMem('Search for gaming laptops'),
+    });
+
+    expect(d.action.action).toBe('fill');
+    if (d.action.action === 'fill') {
+      expect(d.action.value).toBe('gaming laptops');
+    }
+  });
+
+  // Prompt 7: compound with open-cheapest-one
+  it('P7: "search for gaming laptops and open the cheapest one" — active objective yields "gaming laptops"', () => {
+    const d = planLocally({
+      goal: 'search for gaming laptops and open the cheapest one',
+      dom: SEARCH_DOM,
+      taskMemory: taskMem('Search for gaming laptops'),
+    });
+
+    expect(d.action.action).toBe('fill');
+    if (d.action.action === 'fill') {
+      expect(d.action.value).toBe('gaming laptops');
+    }
+  });
+
+  // Generalization: the fix must not be product-specific
+  it('GENERALIZE: "find search box and search for shoes" — active objective "Search for shoes" yields "shoes"', () => {
+    const d = planLocally({
+      goal: 'find search box and search for shoes',
+      dom: SEARCH_DOM,
+      taskMemory: taskMem('Search for shoes'),
+    });
+    expect(d.action.action).toBe('fill');
+    if (d.action.action === 'fill') expect(d.action.value).toBe('shoes');
+  });
+
+  it('GENERALIZE: "find search box and search for wireless headphones" — yields "wireless headphones"', () => {
+    const d = planLocally({
+      goal: 'find search box and search for wireless headphones',
+      dom: SEARCH_DOM,
+      taskMemory: taskMem('Search for wireless headphones'),
+    });
+    expect(d.action.action).toBe('fill');
+    if (d.action.action === 'fill') expect(d.action.value).toBe('wireless headphones');
+  });
+
+  it('GENERALIZE: "find search box and search for programming books" — yields "programming books"', () => {
+    const d = planLocally({
+      goal: 'find search box and search for programming books',
+      dom: SEARCH_DOM,
+      taskMemory: taskMem('Search for programming books'),
+    });
+    expect(d.action.action).toBe('fill');
+    if (d.action.action === 'fill') expect(d.action.value).toBe('programming books');
+  });
+
+  // Original bug trigger from the user's manual test
+  it('ORIGINAL BUG: "look for the search box and search for laptops" — active "Search for laptops" yields "laptops" not the whole phrase', () => {
+    const d = planLocally({
+      goal: 'look for the search box and search for laptops',
+      dom: SEARCH_DOM,
+      taskMemory: taskMem('Search for laptops'),
+    });
+    expect(d.action.action).toBe('fill');
+    if (d.action.action === 'fill') {
+      expect(d.action.value).toBe('laptops');
+      expect(d.action.value).not.toContain('search box');
+    }
+  });
+
+  // Without taskMemory (single-step goal), behaviour is unchanged
+  it('NO REGRESSION: without taskMemory, simple goal still works correctly', () => {
+    const d = planLocally({ goal: 'search for wireless mouse', dom: SEARCH_DOM });
+    expect(d.action.action).toBe('fill');
+    if (d.action.action === 'fill') {
+      expect(d.action.value).toBe('wireless mouse');
+    }
+  });
+});
+
+describe('planLocally — semantic candidate ranking', () => {
+  const SEMANTIC_DOM = dom([
+    node({
+      id: 1,
+      selector: '#q',
+      tag: 'input',
+      type: 'search',
+      role: 'searchbox',
+      placeholder: 'Search',
+      label: 'Search',
+    }),
+    node({
+      id: 2,
+      selector: '#btn',
+      tag: 'button',
+      role: 'button',
+      text: 'Search',
+    }),
+    node({
+      id: 3,
+      selector: '#voice',
+      tag: 'button',
+      role: 'button',
+      label: 'Search by voice', // acts as accessible name
+    }),
+  ]);
+
+  it('S1: "Click the search box" targets the input', () => {
+    const d = planLocally({ goal: 'Click the search box', dom: SEMANTIC_DOM });
+
+    if ('selector' in d.action) {
+      expect(d.action.selector).toBe('#q');
+    }
+  });
+
+  it('S2: "Type \'AI\'" targets the input based on fill intent', () => {
+    const d = planLocally({ goal: 'Type "AI"', dom: SEMANTIC_DOM });
+    // It should pick the input, but what does toAction do for "Type 'AI'"?
+    // It will return 'fill' action with literal "AI", or click. Let's just assert selector.
+    if ('selector' in d.action) {
+      expect(d.action.selector).toBe('#q');
+    }
+  });
+
+  it('S3: "Click the search button" targets the button', () => {
+    const d = planLocally({ goal: 'Click the search button', dom: SEMANTIC_DOM });
+    expect(d.action.action).toBe('click');
+    if ('selector' in d.action) {
+      expect(d.action.selector).not.toBe('#q');
+      expect(['#btn', '#voice']).toContain(d.action.selector);
+    }
+  });
+
+  it('S4: "Use voice search" targets the voice button', () => {
+    const ranking = rankCandidates({ goal: 'Use voice search', dom: SEMANTIC_DOM });
+    const best = ranking.candidates[0];
+    expect(best?.node.selector).toBe('#voice');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * REGRESSION: Target vs Value Conflation
+ *
+ * Ensures that the noun description of the target (e.g. "search box")
+ * does not leak into the search value, and that explicit locators
+ * ("into the search box") are stripped.
+ * ------------------------------------------------------------------ */
+describe('planLocally — target vs value conflation', () => {
+  const SEARCH_DOM = dom([
+    node({
+      id: 1,
+      selector: '#q',
+      tag: 'input',
+      type: 'search',
+      role: 'searchbox',
+    })
+  ]);
+
+  it('V1: "search sih26171" produces value "sih26171"', () => {
+    const d = planLocally({ goal: 'search sih26171', dom: SEARCH_DOM });
+    expect(d.action.action).toBe('fill');
+    if ('value' in d.action) expect(d.action.value).toBe('sih26171');
+  });
+
+  it('V2: "click the search box" produces a focus/click action with NO value', () => {
+    const d = planLocally({ goal: 'click the search box', dom: SEARCH_DOM });
+    expect(d.action.action).toBe('click');
+    expect('value' in d.action).toBe(false);
+  });
+
+  it('V3: "find the search box" produces a focus/click action with NO value', () => {
+    const d = planLocally({ goal: 'find the search box', dom: SEARCH_DOM });
+    expect(d.action.action).toBe('click');
+    expect('value' in d.action).toBe(false);
+  });
+
+  it('V4: "type sih26171 into the search box" strips the locator and produces "sih26171"', () => {
+    const d = planLocally({ goal: 'type sih26171 into the search box', dom: SEARCH_DOM });
+    expect(d.action.action).toBe('fill');
+    if ('value' in d.action) expect(d.action.value).toBe('sih26171');
+  });
+
+  it('V5: "search laptops in the search bar" strips the locator and produces "laptops"', () => {
+    const d = planLocally({ goal: 'search laptops in the search bar', dom: SEARCH_DOM });
+    expect(d.action.action).toBe('fill');
+    if ('value' in d.action) expect(d.action.value).toBe('laptops');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * REGRESSION: Typing vs Submitting
+ * ------------------------------------------------------------------ */
+describe('planLocally — typing vs submitting', () => {
+  const SEARCH_DOM = dom([
+    node({
+      id: 1,
+      selector: '#q',
+      tag: 'input',
+      type: 'search',
+      role: 'searchbox',
+      value: 'ai', // Already has 'ai' typed
+    })
+  ]);
+
+  it('T1: "type ai" DOES NOT submit', () => {
+    const d = planLocally({ goal: 'type ai', dom: SEARCH_DOM });
+    expect(d.action.action).toBe('fill');
+    if ('submit' in d.action) expect(d.action.submit).toBe(false);
+  });
+
+  it('T2: "Submit the search" on an input field acts as a pure enter', () => {
+    // If the planner couldn't find a dedicated button, it focuses the input
+    // with submit: true and value preserved.
+    const d = planLocally({ goal: 'Submit the search', dom: SEARCH_DOM });
+    expect(d.action.action).toBe('fill');
+    if ('submit' in d.action) expect(d.action.submit).toBe(true);
+    if ('value' in d.action) expect(d.action.value).toBe('ai');
+  });
+
+  it('Fixture A: selects button[type=submit] over button[type=button] Voice Search', () => {
+    const FIXTURE_A_DOM = dom([
+      node({ id: 1, selector: '#search', tag: 'input', type: 'search', role: 'searchbox', formId: 1 }),
+      node({ id: 2, selector: '#submit-btn', tag: 'button', type: 'submit', label: 'Search', formId: 1 }),
+      node({ id: 3, selector: '#voice-btn', tag: 'button', type: 'button', label: 'Voice Search', formId: 1 }),
+    ]);
+
+    const ranking = rankCandidates({ goal: 'Submit the search', dom: FIXTURE_A_DOM });
+    expect(ranking.candidates.length).toBeGreaterThan(0);
+    expect(ranking.candidates[0]?.node.selector).toBe('#submit-btn');
+
+    const decision = planLocally({ goal: 'Submit the search', dom: FIXTURE_A_DOM });
+    expect(decision.action.action).toBe('click');
+    if (decision.action.action === 'click') {
+      expect(decision.action.selector).toBe('#submit-btn');
+    }
+  });
+});
+
+

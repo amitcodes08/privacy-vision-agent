@@ -14,9 +14,12 @@ export const PROTOCOL_VERSION = 1 as const;
 export type ActionKind =
   | 'click'
   | 'fill'
+  | 'type'
+  | 'select'
   | 'scroll'
   | 'navigate'
   | 'wait'
+  | 'back'
   | 'escalate'
   | 'done'
   | 'invalid';
@@ -43,17 +46,51 @@ export interface ActionBase {
 export interface ClickAction extends ActionBase {
   action: 'click';
   selector: string;
+  /** Numeric ScrubbedNode.id — set when the model addressed by ID. Preferred by the executor. */
+  elementId?: number;
   reason?: string;
 }
 
 export interface FillAction extends ActionBase {
   action: 'fill';
   selector: string;
+  /** Numeric ScrubbedNode.id — set when the model addressed by ID. Preferred by the executor. */
+  elementId?: number;
   /** Where the client should source the text from. */
   valueType: ValueToken;
   /** Only populated when `valueType === 'LITERAL'` (non-sensitive text). */
   value?: string;
   submit?: boolean;
+  reason?: string;
+}
+
+/**
+ * ID-first type action: the model names a semantic element by its numeric ID
+ * and supplies a plain literal value. Used for non-sensitive text entry.
+ * The executor resolves elementId → live element; selector is never required.
+ */
+export interface TypeAction extends ActionBase {
+  action: 'type';
+  /** ScrubbedNode.id from the current page observation. */
+  elementId: number;
+  value: string;
+  submit?: boolean;
+  reason?: string;
+}
+
+/**
+ * ID-first select action: changes the value of a <select> or combobox.
+ */
+export interface SelectAction extends ActionBase {
+  action: 'select';
+  elementId: number;
+  value: string;
+  reason?: string;
+}
+
+/** Navigate browser history backwards. */
+export interface BackAction extends ActionBase {
+  action: 'back';
   reason?: string;
 }
 
@@ -97,9 +134,12 @@ export interface InvalidAction extends ActionBase {
 export type AgentAction =
   | ClickAction
   | FillAction
+  | TypeAction
+  | SelectAction
   | ScrollAction
   | NavigateAction
   | WaitAction
+  | BackAction
   | EscalateAction
   | DoneAction
   | InvalidAction;
@@ -186,6 +226,7 @@ export interface ScrubbedNode {
   parentId?: number;
   childIds?: number[];
   depth?: number;
+  formId?: number;
 
   role?: string;
   type?: string;
@@ -389,9 +430,12 @@ export const DEFAULTS = {
 const ACTION_KINDS: readonly ActionKind[] = [
   'click',
   'fill',
+  'type',
+  'select',
   'scroll',
   'navigate',
   'wait',
+  'back',
   'escalate',
   'done',
   'invalid',
@@ -407,13 +451,22 @@ export function isAgentAction(value: unknown): value is AgentAction {
   if (!isActionKind(a.action)) return false;
   switch (a.action) {
     case 'click':
-      return typeof a.selector === 'string' && a.selector.length > 0;
+      // Accept either a selector (legacy) or an elementId (new ID-first path).
+      return (typeof a.selector === 'string' && a.selector.length > 0) ||
+             (typeof a.elementId === 'number' && Number.isFinite(a.elementId));
     case 'fill':
       return typeof a.selector === 'string' && typeof a.valueType === 'string';
+    case 'type':
+      return typeof a.elementId === 'number' && Number.isFinite(a.elementId) &&
+             typeof a.value === 'string';
+    case 'select':
+      return typeof a.elementId === 'number' && Number.isFinite(a.elementId) &&
+             typeof a.value === 'string';
     case 'navigate':
       return typeof a.url === 'string' && /^https?:\/\//i.test(a.url);
     case 'wait':
       return typeof a.ms === 'number' && Number.isFinite(a.ms);
+    case 'back':
     case 'scroll':
     case 'escalate':
     case 'done':

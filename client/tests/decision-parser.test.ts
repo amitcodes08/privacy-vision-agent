@@ -75,7 +75,10 @@ describe('parseAction', () => {
 
   it('maps action synonyms', () => {
     expect(parseAction('{"action":"press","id":0}', DOM).action.action).toBe('click');
-    expect(parseAction('{"action":"type","id":1}', DOM).action.action).toBe('fill');
+    // "type" now maps to TypeAction (id-first, value required). Without value → invalid.
+    expect(parseAction('{"action":"type","id":1}', DOM).action.action).toBe('invalid');
+    // With value, "type" produces TypeAction
+    expect(parseAction('{"action":"type","id":1,"value":"hello"}', DOM).action.action).toBe('type');
     expect(parseAction('{"action":"finish"}', DOM).action.action).toBe('done');
   });
 

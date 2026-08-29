@@ -9,8 +9,18 @@ import type { AgentAction } from '@shared/types';
 import { buildScrubbedDom } from './dom-scrubber';
 import { dedupeBoxes } from '~/privacy/canvas-redactor';
 import { hydrate } from './value-hydrator';
+import { resolveElement } from '~/agent/element-resolver';
 
 let lastIndex = new Map<string, Element>();
+/** Last observed DOM — used for elementId resolution. Refreshed on every SCRAPE. */
+let lastDom: import('@shared/types').ScrubbedDom = {
+  url: '',
+  origin: '',
+  title: '',
+  viewport: { width: 0, height: 0, scrollX: 0, scrollY: 0 },
+  nodes: [],
+  redactionSummary: {},
+};
 
 chrome.runtime.onMessage.addListener((msg: { kind?: string; action?: AgentAction; actions?: AgentAction[]; timeoutMs?: number }, _sender, sendResponse) => {
   void (async () => {
@@ -22,6 +32,7 @@ chrome.runtime.onMessage.addListener((msg: { kind?: string; action?: AgentAction
       if (msg?.kind === 'SCRAPE') {
         const { dom, sensitiveBoxes, index } = buildScrubbedDom(document);
         lastIndex = index;
+        lastDom = dom;
         sendResponse({
           ok: true,
           dom,
@@ -134,15 +145,42 @@ function getOperableElement(el: HTMLElement): HTMLElement {
 async function perform(action: AgentAction): Promise<string> {
   switch (action.action) {
     case 'click': {
-      const el = resolve(action.selector);
+      // Prefer elementId resolution (generic) over raw CSS selector (legacy).
+      let el: HTMLElement;
+      if (action.elementId !== undefined) {
+        el = resolveElement(
+          { elementId: action.elementId, _legacySelector: action.selector },
+          lastIndex,
+          lastDom,
+        );
+        console.debug(`[EXECUTOR] click elementId=${action.elementId} → ${el.tagName}`);
+      } else {
+        el = resolve(action.selector);
+        console.debug(`[EXECUTOR] click selector="${action.selector}"`);
+      }
+      const attrs = Array.from(el.attributes).map(a => `${a.name}="${a.value}"`).join(' ');
+      const accName = el.getAttribute('aria-label') || el.getAttribute('title') || (el.innerText || el.textContent || '').trim();
+      console.log(`\nEXECUTOR TARGET:\nelementId=${'elementId' in action ? action.elementId : 'undefined'}\nresolved element tag=${el.tagName.toLowerCase()}\nresolved element attributes=${attrs}\nresolved accessible name=${accName}`);
       el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' as ScrollBehavior });
       flash(el);
       robustClick(el);
-      return `clicked ${action.selector}`;
+      return `clicked ${action.elementId !== undefined ? `e${action.elementId}` : action.selector}`;
     }
+
     case 'fill': {
-      const el = resolve(action.selector);
-      if (!isEditable(el)) throw new Error(`${action.selector} is not editable`);
+      let el: HTMLElement;
+      if (action.elementId !== undefined) {
+        el = resolveElement(
+          { elementId: action.elementId, _legacySelector: action.selector },
+          lastIndex,
+          lastDom,
+        );
+        console.debug(`[EXECUTOR] fill elementId=${action.elementId} → ${el.tagName}`);
+      } else {
+        el = resolve(action.selector);
+        console.debug(`[EXECUTOR] fill selector="${action.selector}"`);
+      }
+      if (!isEditable(el)) throw new Error(`target is not editable`);
       const value = await hydrate(action);
       el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' as ScrollBehavior });
       flash(el);
@@ -150,8 +188,52 @@ async function perform(action: AgentAction): Promise<string> {
       if (action.submit) {
         submitFormOrEnter(el);
       }
-      return `filled ${action.selector} from ${action.valueType}`;
+      return `filled ${action.elementId !== undefined ? `e${action.elementId}` : action.selector} from ${action.valueType}`;
     }
+
+    case 'type': {
+      // ID-first text entry: no selector needed.
+      const el = resolveElement(
+        {
+          elementId: action.elementId,
+          label: undefined,
+          text: undefined,
+        },
+        lastIndex,
+        lastDom,
+      );
+      console.debug(`[EXECUTOR] type elementId=${action.elementId} value=[SAFE] → ${el.tagName}`);
+      if (!isEditable(el)) throw new Error(`elementId ${action.elementId} is not editable`);
+      el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' as ScrollBehavior });
+      flash(el);
+      setNativeValue(el, action.value);
+      if (action.submit) {
+        submitFormOrEnter(el);
+      }
+      return `typed into e${action.elementId}`;
+    }
+
+    case 'select': {
+      const el = resolveElement(
+        { elementId: action.elementId },
+        lastIndex,
+        lastDom,
+      );
+      console.debug(`[EXECUTOR] select elementId=${action.elementId} value="${action.value}"`);
+      if (!(el instanceof HTMLSelectElement)) {
+        throw new Error(`elementId ${action.elementId} is not a <select>`);
+      }
+      el.value = action.value;
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return `selected "${action.value}" in e${action.elementId}`;
+    }
+
+    case 'back': {
+      console.debug(`[EXECUTOR] back → window.history.back()`);
+      window.history.back();
+      return 'navigated back';
+    }
+
     case 'scroll': {
       if (action.selector) {
         resolve(action.selector).scrollIntoView({ block: 'center', behavior: 'smooth' });
@@ -177,11 +259,13 @@ async function perform(action: AgentAction): Promise<string> {
   }
 }
 
+
 /**
  * Dispatches a complete PointerEvent and MouseEvent cascade with exact center coordinates,
  * ensuring custom SPA framework event handlers (React, Vue, Svelte) receive authentic interactions.
  */
 function robustClick(el: HTMLElement): void {
+  console.log(`\nACTUAL CLICK TARGET:\ntag=${el.tagName.toLowerCase()}\ntype=${el.getAttribute('type') ?? 'undefined'}\naria-label=${el.getAttribute('aria-label') ?? 'undefined'}\ntext=${(el.innerText || el.textContent || '').trim().slice(0, 50)}`);
   const rect = el.getBoundingClientRect();
   const clientX = Math.round(rect.left + Math.max(1, rect.width / 2));
   const clientY = Math.round(rect.top + Math.max(1, rect.height / 2));

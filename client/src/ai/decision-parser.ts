@@ -12,6 +12,7 @@
  */
 import { type AgentAction, type AgentDecision, type ScrubbedDom, type ScrubbedNode, type ValueToken } from '@shared/types';
 import { inferValueType, rankCandidates, rankOf, type Ranking } from './local-planner';
+import { buildPageModel } from '~/agent/page-model';
 
 /** How many elements the prompt may list. Small models degrade with long lists. */
 const PROMPT_BUDGET = 36;
@@ -70,25 +71,39 @@ export function buildPrompt(
     }
   }
 
+  const pageModel = buildPageModel(dom);
   const lines = [...chosen.values()]
     .sort((a, b) => a.id - b.id)
     .map((n) => {
-      const bits = [
-        n.tag,
-        n.type && `type=${n.type}`,
-        n.role && `role=${n.role}`,
-        n.label && `label="${trunc(n.label)}"`,
-        n.text && `text="${trunc(n.text)}"`,
-        n.placeholder && `placeholder="${trunc(n.placeholder)}"`,
-        n.context && `context="${trunc(n.context)}"`,
-        n.value && `value="${trunc(n.value)}"`,
-      ]
-        .filter(Boolean)
-        .join(' ');
-
-      return `${n.id}: ${bits}${
-        relevant.has(n.id) ? '  <-- mentions your goal' : ''
-      }`;
+      const sem = pageModel.byId(n.id);
+      if (!sem) {
+        // Fallback to legacy format for nodes not in the page model
+        const bits = [
+          n.tag,
+          n.type && `type=${n.type}`,
+          n.role && `role=${n.role}`,
+          n.label && `label="${trunc(n.label)}"`,
+          n.text && `text="${trunc(n.text)}"`,
+          n.placeholder && `placeholder="${trunc(n.placeholder)}"`,
+          n.context && `context="${trunc(n.context)}"`,
+          n.value && `value="${trunc(n.value)}"`,
+        ]
+          .filter(Boolean)
+          .join(' ');
+        return `${n.id}: ${bits}${relevant.has(n.id) ? '  <-- mentions your goal' : ''}`;
+      }
+      // Use canonical page-model format
+      const parts: string[] = [sem.tag];
+      if (sem.role) parts.push(`role=${sem.role}`);
+      if (sem.type && sem.type !== sem.tag) parts.push(`type=${sem.type}`);
+      if (sem.label) parts.push(`label="${trunc(sem.label)}"`);
+      if (sem.text) parts.push(`text="${trunc(sem.text)}"`);
+      if (sem.placeholder) parts.push(`placeholder="${trunc(sem.placeholder)}"`);
+      if (sem.name) parts.push(`name="${trunc(sem.name)}"`);
+      if (sem.value) parts.push(`value="${trunc(sem.value)}"`);
+      if (sem.context) parts.push(`context="${trunc(sem.context, 60)}"`);
+      if (n.disabled) parts.push('disabled');
+      return `${n.id}: ${parts.join(' ')}${relevant.has(n.id) ? '  <-- mentions your goal' : ''}`;
     });
 
   const past = history
@@ -153,13 +168,20 @@ export function buildPrompt(
     '',
     'OUTPUT EXACTLY ONE JSON OBJECT:',
     '{"action":"click","id":123}',
+    '{"action":"type","id":123,"value":"text"}',
     '{"action":"fill","id":123,"valueType":"LITERAL","value":"text"}',
+    '{"action":"fill","id":123,"valueType":"USER_EMAIL"}',
+    '{"action":"select","id":123,"value":"option text"}',
     '{"action":"scroll","deltaY":600}',
+    '{"action":"back"}',
     '',
-    'Allowed actions: click, fill, scroll, escalate',
+    'Allowed actions: click, type, fill, select, scroll, back, escalate',
     'For click: "id" is required.',
-    'For fill: "id", "valueType", and "value" are required.',
+    'For type: "id" and "value" are required. Use for non-sensitive text (search queries, names, etc.).',
+    'For fill: "id", "valueType" are required. "value" only when valueType is LITERAL.',
+    'For select: "id" and "value" (the option text) are required.',
     'For scroll: "deltaY" is optional.',
+    'Use "back" to navigate to the previous page.',
     'Return JSON only.',
   ]
     .filter(Boolean)
@@ -170,10 +192,11 @@ const trunc = (s: string, n = 48) => (s.length > n ? `${s.slice(0, n)}…` : s);
 
 const ACTION_SYNONYMS: Record<string, AgentAction['action']> = {
   click: 'click', press: 'click', tap: 'click', push: 'click', select: 'click', open: 'click',
-  fill: 'fill', type: 'fill', enter: 'fill', input: 'fill', write: 'fill', set: 'fill',
+  fill: 'fill', type: 'type', enter: 'fill', input: 'fill', write: 'fill', set: 'fill',
   scroll: 'scroll', navigate: 'navigate', goto: 'navigate', go: 'navigate',
   wait: 'wait', done: 'done', finish: 'done', complete: 'done', stop: 'done', end: 'done',
   escalate: 'escalate', unsure: 'escalate', unknown: 'escalate',
+  back: 'back', backward: 'back', goback: 'back',
 };
 
 const VALUE_TOKENS = new Set<ValueToken>([
@@ -361,6 +384,34 @@ function normalize(obj: Record<string, unknown>, dom: ScrubbedDom): { action: Ag
     };
   }
 
+  if (kind === 'back') {
+    return { action: { action: 'back', reason: str(obj.reason), ...memFields }, match: 'none' };
+  }
+
+  if (kind === 'type') {
+    // ID-first type action: model must provide an element id.
+    const typeId = num(obj.id ?? obj.element_id ?? obj.elementId ?? obj.index);
+    const typeValue = str(obj.value ?? obj.text);
+    if (typeId === undefined || !typeValue) {
+      return { action: { action: 'invalid', reason: 'type action requires id and value' }, match: 'none' };
+    }
+    const typeNode = dom.nodes.find((n) => n.id === typeId);
+    if (!typeNode) {
+      return { action: { action: 'invalid', reason: `type: element id ${typeId} not found in DOM` }, match: 'none' };
+    }
+    return {
+      action: {
+        action: 'type',
+        elementId: typeId,
+        value: typeValue,
+        ...(bool(obj.submit) ? { submit: true } : {}),
+        reason: str(obj.reason),
+        ...memFields,
+      },
+      match: 'exact',
+    };
+  }
+
   // click / fill both need a target element.
   if (!resolved.node) {
     const selector = str(obj.selector ?? obj.css ?? obj.element);
@@ -389,6 +440,8 @@ function normalize(obj: Record<string, unknown>, dom: ScrubbedDom): { action: Ag
       action: {
         action: 'fill',
         selector: node.selector,
+        // Embed elementId so the executor can use ID-first resolution.
+        elementId: node.id,
         valueType,
         reason: str(obj.reason),
         ...(valueType === 'LITERAL' ? literal(obj) : {}),
@@ -403,7 +456,17 @@ function normalize(obj: Record<string, unknown>, dom: ScrubbedDom): { action: Ag
     return { action: { action: 'invalid', reason: 'click action contained fill fields' }, match: 'none' };
   }
 
-  return { action: { action: 'click', selector: node.selector, reason: str(obj.reason), ...memFields }, match: resolved.match };
+  return {
+    action: {
+      action: 'click',
+      selector: node.selector,
+      // Embed elementId so the executor can use ID-first resolution.
+      elementId: node.id,
+      reason: str(obj.reason),
+      ...memFields,
+    },
+    match: resolved.match,
+  };
 }
 
 /**

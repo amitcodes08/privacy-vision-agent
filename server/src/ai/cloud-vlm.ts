@@ -60,14 +60,25 @@ You receive a REDACTED screenshot (black rectangles cover private data) and a
 scrubbed element list. Choose exactly ONE next action.
 
 Rules:
-- Output JSON only, matching: {"action":"click|fill|scroll|navigate|wait|done",
-  "selector":"<css from the list>","valueType":"USER_EMAIL|USER_FULL_NAME|USER_PHONE|USER_ADDRESS|LITERAL",
-  "value":"<only when valueType is LITERAL>","confidence":0..1,"reason":"<short>"}
-- Only use selectors that appear verbatim in ELEMENTS.
-- IMPORTANT: You must ONLY emit one of the allowed executable actions (click, fill, scroll, navigate, wait, done). NEVER emit semantic phrases like "add to cart" as the "action" field.
-- Disambiguation: When multiple elements have similar actions (e.g. multiple "Add to Cart", "Select", or "Buy" buttons for different products), you MUST match the specific item/product named in the GOAL or CURRENT OBJECTIVE by inspecting each element's context, label, or text. Choose only the ONE single element that corresponds to the requested item.
-- Single Execution: Once an action for the active objective/goal has already been performed or the goal is satisfied, emit "done" rather than clicking duplicate or additional item buttons.
-- If the goal requires interacting with a destination, prefer actionable state-changing elements (buttons) over navigation links.
+- Output JSON only, matching one of these schemas:
+  {"action":"click","id":<element number from list>,"reason":"<short>"}
+  {"action":"type","id":<element number from list>,"value":"<literal text>","reason":"<short>"}
+  {"action":"fill","id":<element number from list>,"valueType":"USER_EMAIL|USER_FULL_NAME|USER_PHONE|USER_ADDRESS|LITERAL","value":"<only when LITERAL>","reason":"<short>"}
+  {"action":"select","id":<element number from list>,"value":"<option text>","reason":"<short>"}
+  {"action":"scroll","deltaY":<pixels>,"reason":"<short>"}
+  {"action":"navigate","url":"<absolute url>"}
+  {"action":"back"}
+  {"action":"done","summary":"<short>"}
+  {"action":"wait","ms":1000}
+- "id" must be the NUMBER shown at the start of an ELEMENTS line. Never invent an id.
+- Use "type" for non-sensitive literal text (search queries, names). Use "fill" with a valueType for private data.
+- IMPORTANT: You must ONLY emit one of the allowed executable actions listed above.
+- Disambiguation: When multiple elements have similar actions (e.g. multiple "Add to Cart" buttons)
+  inspect each element\'s context, label, or text and choose only the ONE that matches the GOAL.
+- Single Execution: Once an action for the active objective/goal has already been performed or
+  the goal is satisfied, emit "done" rather than clicking duplicate buttons.
+- If the goal requires interacting with a destination, prefer actionable state-changing elements
+  (buttons) over navigation links.
 - Never invent or guess redacted content. Never emit passwords or OTP codes;
   the client refuses them.
 - Prefer "done" when the goal is already satisfied by the visible page.`;
@@ -272,18 +283,21 @@ export function userPrompt(req: InferenceRequestPayload): string {
     `LOCAL MODEL GAVE UP: confidence=${req.localConfidence ?? 'n/a'} reason=${req.localReason ?? 'n/a'}`,
     req.taskMemory?.lastAction ? `LAST ACTION/RESULT: ${req.taskMemory.lastAction.action.action} -> ${req.taskMemory.lastAction.result}` : '',
     req.history?.length ? `HISTORY: ${req.history.map((h) => h.action).join(' -> ')}` : '',
-    'ELEMENTS:',
+    'ELEMENTS (id: tag [role=...] [label="..."] [text="..."] [placeholder="..."] [disabled]):',
     ...dom.nodes.slice(0, 80).map(
       (n) =>
+        // Render elements by semantic attributes only — no CSS selectors exposed to the cloud model.
         `[${n.id}] <${n.tag}${n.type ? ` type=${n.type}` : ''}>` +
+        `${n.role ? ` role=${n.role}` : ''}` +
         `${n.label ? ` label="${n.label}"` : ''}${n.text ? ` text="${n.text}"` : ''}` +
+        `${n.placeholder ? ` placeholder="${n.placeholder}"` : ''}` +
         `${n.context ? ` context="${n.context}"` : ''}` +
         `${n.value ? ` value="${n.value}"` : ''}${n.redacted?.length ? ` [redacted:${n.redacted.join(',')}]` : ''}` +
-        ` selector=${n.selector}`,
+        `${n.disabled ? ' disabled' : ''}`,
     ),
   ]
-    .filter(Boolean)
-    .join('\n');
+  .filter(Boolean)
+  .join('\n');
 }
 
 /** Strip anything the model should not have sent. */
