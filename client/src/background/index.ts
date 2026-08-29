@@ -42,6 +42,7 @@ import { sanitiseCloudAction } from '~/ai/decision-parser';
 import { createNanoRouter } from '~/ai/nano-bridge';
 import type { NanoProbe } from '~/ai/nano-session';
 import { globalActionCache } from '~/ai/action-cache';
+import { globalSpeculativePlanner } from '~/ai/speculative-planner';
 
 const OFFSCREEN_PATH = 'src/offscreen/index.html';
 
@@ -392,6 +393,16 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
   const origin = currentTab?.url ? new URL(currentTab.url).origin : '';
   const currentObj = taskMemory?.currentObjective || goal;
 
+  // --- Path 00: Speculative Pre-Grounding (Zero latency pipeline) ---
+  const speculative = globalSpeculativePlanner.consume(currentObj, dom);
+  if (speculative) {
+    logger.info('speculative', `hit for pre-grounded objective "${currentObj}" (${speculative.action.action})`);
+    status.heuristicDecisions++;
+    const applied = await applyDecision(tabId, speculative, dom);
+    globalSpeculativePlanner.speculateNext(taskMemory, applied.postDom, [...history, applied.action]);
+    return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom, observed: applied.observed, tabId: applied.tabId };
+  }
+
   // --- Path 0A: Action Cache (Zero model latency, zero network) -----
   if (origin) {
     const cached = globalActionCache.get(origin, currentObj, dom);
@@ -474,6 +485,7 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
     } else {
       status.localDecisions++;
       const applied = await applyDecision(tabId, decision, dom);
+      globalSpeculativePlanner.speculateNext(taskMemory, applied.postDom, [...history, applied.action]);
       return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom, observed: applied.observed, tabId: applied.tabId };
     }
   }
@@ -490,6 +502,7 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
     if (planned.confidence >= Math.max(settings.confidenceThreshold, 0.60) && planned.action.action !== 'escalate') {
       status.heuristicDecisions++;
       const applied = await applyDecision(tabId, planned, dom);
+      globalSpeculativePlanner.speculateNext(taskMemory, applied.postDom, [...history, applied.action]);
       return { action: applied.action, preDom: applied.preDom, postDom: applied.postDom, observed: applied.observed, tabId: applied.tabId };
     }
   }

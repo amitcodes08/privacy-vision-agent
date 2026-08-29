@@ -1471,6 +1471,16 @@
 
           <div class="flow-connector">↓</div>
 
+          <div class="flow-node" style="border-color: rgba(245, 158, 11, 0.4); background: rgba(245, 158, 11, 0.05);">
+            <div class="flow-node-content">
+              <h4><span>⚡</span> ActionCache & Visual Bypass Engine</h4>
+              <p>Structural DOM fingerprinting matches recurring paths; high-confidence targets skip frame capture and model latency entirely.</p>
+            </div>
+            <span class="flow-node-badge" style="background: rgba(245, 158, 11, 0.15); color: var(--amber);">Instant Local</span>
+          </div>
+
+          <div class="flow-connector">↓</div>
+
           <div class="flow-node" style="border-color: rgba(56, 189, 248, 0.4); background: rgba(56, 189, 248, 0.05);">
             <div class="flow-node-content">
               <h4><span>⚡</span> WebGPU Worker & SmolVLM-256M</h4>
@@ -1615,15 +1625,32 @@ ctx.fillRect(box.x, box.y, box.w, box.h);
           <h3>Termination Safeguards</h3>
           <p>Multi-step completion validator asserts full plan satisfaction, preventing early exit on intermediate search result pages.</p>
         </div>
+
+        <div class="dive-card">
+          <div class="dive-icon indigo">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+          </div>
+          <h3>Action & Selector Caching</h3>
+          <p>Structural DOM fingerprinting caches verified selector paths, skipping VLM inference on recurring page flows (inspired by Stagehand & Midscene.js).</p>
+        </div>
+
+        <div class="dive-card">
+          <div class="dive-icon cyan">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+          </div>
+          <h3>Multi-Action Macro Execution</h3>
+          <p>Executes sequential action arrays (e.g. fill + submit) in 1 query step with <code>MutationObserver</code> event-driven DOM settlement.</p>
+        </div>
       </div>
 
       <!-- Tech pills -->
       <div class="tech-grid">
         <span class="tech-tag">⚡ Chrome Prompt API (Gemini Nano)</span>
         <span class="tech-tag">🚀 WebGPU Compute</span>
+        <span class="tech-tag">🎯 ActionCache Engine</span>
         <span class="tech-tag">📦 Transformers.js v3</span>
         <span class="tech-tag">👁️ SmolVLM-256M-Instruct</span>
-        <span class="tech-tag">🧩 Qwen2-VL</span>
+        <span class="tech-tag">⚡ Visual Bypass Fast-Path</span>
         <span class="tech-tag">⚙️ ONNX Runtime Web</span>
         <span class="tech-tag">🛡️ Chrome MV3</span>
         <span class="tech-tag">🔌 WebSockets</span>
