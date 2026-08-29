@@ -582,6 +582,9 @@ export function buildScrubbedDom(
   const index =
     new Map<string, Element>();
 
+  const formMap = new Map<Element, number>();
+  let nextFormId = 1;
+
   const summary:
     Partial<Record<
       RedactionReason,
@@ -792,6 +795,15 @@ export function buildScrubbedDom(
         1;
     }
 
+    let formId: number | undefined;
+    const formEl = (el as HTMLInputElement).form ?? el.closest('form');
+    if (formEl) {
+      if (!formMap.has(formEl)) {
+        formMap.set(formEl, nextFormId++);
+      }
+      formId = formMap.get(formEl);
+    }
+
     /* ------------------------------------------------------------ *
      * Base node
      * ------------------------------------------------------------ */
@@ -808,6 +820,10 @@ export function buildScrubbedDom(
 
       ...(parentId !== undefined
         ? { parentId }
+        : {}),
+
+      ...(formId !== undefined
+        ? { formId }
         : {}),
 
       depth,

@@ -508,7 +508,7 @@ async function step(tabId: number, goal: string, history: AgentAction[], setting
   }
 
   const best = decision ?? planned;
-  const onDevice = () => pickActionable(decision, planned) ?? pickActionable(planLocally({ goal, dom, history }), null);
+  const onDevice = () => pickActionable(decision, planned) ?? pickActionable(planLocally({ goal, dom, history, taskMemory }), null);
 
   // --- Path 3: redact, then escalate -----------------------------
   if (!settings.allowEscalation || escalationDown) {
@@ -601,8 +601,11 @@ function pickActionable(
 }
 
 /** Identity of an action for loop detection — kind plus target, no reason text. */
-const domFingerprint = (a: AgentAction): string =>
-  'selector' in a && a.selector ? `${a.action}:${a.selector}` : a.action;
+const domFingerprint = (a: AgentAction): string => {
+  if ('elementId' in a && a.elementId !== undefined) return `${a.action}:e${a.elementId}`;
+  if ('selector' in a && a.selector) return `${a.action}:${a.selector}`;
+  return a.action;
+};
 
 /** How many times the most recent action repeats consecutively at the tail. */
 function repeatedTail(history: readonly AgentAction[]): number {
@@ -876,7 +879,11 @@ function isActionMatchingObjective(
   if (objTokens.length === 0) return true;
 
   if (action.action === 'click') {
-    const node = preDom.nodes.find((n) => n.selector === action.selector);
+    // Prefer elementId lookup; fall back to selector for legacy actions.
+    const node =
+      action.elementId !== undefined
+        ? preDom.nodes.find((n) => n.id === action.elementId)
+        : preDom.nodes.find((n) => n.selector === action.selector);
     if (!node) return false;
     const nodeHay = [node.label, node.text, node.context, node.placeholder, node.name, node.role, node.tag]
       .filter(Boolean)
@@ -889,7 +896,16 @@ function isActionMatchingObjective(
   }
 
   if (action.action === 'fill') {
-    const node = preDom.nodes.find((n) => n.selector === action.selector);
+    // A search objective is not complete just because we typed a query; it must
+    // actually navigate to a results page and be verified by the DOM checker.
+    if (/\b(?:search|find|lookup|query)\b(?!\s+(?:box|bar|field|input|button|icon|result))/i.test(objective)) {
+      return false;
+    }
+
+    const node =
+      action.elementId !== undefined
+        ? preDom.nodes.find((n) => n.id === action.elementId)
+        : preDom.nodes.find((n) => n.selector === action.selector);
     const nodeHay = [node?.label, node?.text, node?.context, node?.placeholder, node?.name, action.value]
       .filter(Boolean)
       .join(' ')
@@ -898,7 +914,17 @@ function isActionMatchingObjective(
     if (matches.length > 0) return true;
   }
 
-  if (action.action === 'navigate') {
+  if (action.action === 'type') {
+    const node = preDom.nodes.find((n) => n.id === action.elementId);
+    const nodeHay = [node?.label, node?.text, node?.context, node?.placeholder, node?.name, action.value]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
+    const matches = objTokens.filter((t) => nodeHay.includes(t));
+    if (matches.length > 0) return true;
+  }
+
+  if (action.action === 'navigate' || action.action === 'back') {
     return true;
   }
 
@@ -1269,7 +1295,10 @@ export async function runAgent(goal: string, tabId: number): Promise<void> {
       if (resultCategory === 'state_changed') {
         taskMemory.attemptedTargets = [];
       } else if (resultCategory === 'no_change' || resultCategory === 'failed') {
-        if ('selector' in action && action.selector) {
+        // Track attempted targets by both selector and elementId for robustness.
+        if ('elementId' in action && action.elementId !== undefined) {
+          taskMemory.attemptedTargets.push(`e${action.elementId}`);
+        } else if ('selector' in action && action.selector) {
           taskMemory.attemptedTargets.push(action.selector);
         }
       }

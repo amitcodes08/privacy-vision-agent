@@ -138,6 +138,17 @@ export function planLocally(input: PlanInput): AgentDecision {
   const ranking = rankCandidates(input);
   const best = ranking.candidates[0];
 
+  /**
+   * Use the active sub-objective as the goal text for value extraction.
+   *
+   * `rankCandidates` already does this (line 229: `targetGoal`), so the
+   * correct element is selected. The bug was that `toAction` still received
+   * `input.goal` (the full compound user phrase), causing `literalFor` to
+   * return "the search box and search for gaming laptops" instead of "gaming
+   * laptops" when the current objective was "Search for gaming laptops".
+   */
+  const effectiveGoal = input.taskMemory?.currentObjective?.trim() || input.goal;
+
   if (!best) {
     if (ranking.intent.scroll) {
       return {
@@ -161,9 +172,26 @@ export function planLocally(input: PlanInput): AgentDecision {
     };
   }
 
-  const act = toAction(best.node, input.goal, ranking);
+  const isSubmitObjective = /\b(submit|search|go|send)\b/i.test(effectiveGoal);
+  if (isSubmitObjective && best) {
+    const isInvalid = best.node.type === 'button' || isSpecializedNonSubmitControl(best.node);
+    if (isInvalid) {
+      console.log('!!! INVALID SUBMIT TARGET !!!');
+    }
+    console.log(
+      `\nSELECTED SUBMIT CANDIDATE:\nelementId=${best.node.id}\nreason=${describe(best.node)}\nscore=${best.score}`,
+    );
+  }
+
+  const act = toAction(best.node, effectiveGoal, ranking, input.taskMemory?.goal || input.goal);
   const conf = scoreToConfidence(best.score, ranking.breadth);
   let macroActions: AgentAction[] | undefined;
+
+  if (isSubmitObjective) {
+    console.log(
+      `\nPLANNER ACTION:\naction=${act.action}\nelementId=${'elementId' in act ? act.elementId : 'undefined'}\nselector=${'selector' in act ? act.selector : 'undefined'}\nvalue=${'value' in act ? act.value : 'undefined'}`,
+    );
+  }
 
   if (act.action === 'fill' && act.submit) {
     macroActions = [act];
@@ -176,6 +204,7 @@ export function planLocally(input: PlanInput): AgentDecision {
     source: 'heuristic',
   };
 }
+
 
 export interface Candidate {
   node: ScrubbedNode;
@@ -213,6 +242,11 @@ export interface Ranking {
    * Meaningful target tokens used for entity/result matching.
    */
   targetTokens: string[];
+
+  /**
+   * Whether the objective explicitly named an input control (e.g. "search box").
+   */
+  explicitInput?: boolean;
 }
 
 /**
@@ -229,6 +263,7 @@ export function rankCandidates(input: PlanInput): Ranking {
   const targetGoal = taskMemory?.currentObjective?.trim() || goal.trim();
   const searchQuery = extractSearchQuery(targetGoal);
   const targetTokens = extractTargetTokens(searchQuery ?? targetGoal);
+  const explicitInput = /\b(box|field|input|textbox|searchbox)\b/.test(targetGoal.toLowerCase());
 
   const intent: Intent = {
     fill: INTENT.fill.test(targetGoal),
@@ -282,6 +317,13 @@ export function rankCandidates(input: PlanInput): Ranking {
     mode = 'control';
   }
 
+  const searchFormIds = new Set<number>();
+  for (const n of dom.nodes) {
+    if (!n.disabled && n.visible && isSearchControl(n) && n.formId !== undefined) {
+      searchFormIds.add(n.formId);
+    }
+  }
+
   const candidates = dom.nodes
     .filter((n) => !n.disabled && n.visible)
     .map((node) => ({
@@ -294,10 +336,23 @@ export function rankCandidates(input: PlanInput): Ranking {
         mode,
         searchQuery,
         targetGoal,
+        searchFormIds,
       ),
     }))
     .filter((c) => c.score > 0)
     .sort((a, b) => b.score - a.score);
+
+  if (/\b(submit|search|go|send)\b/i.test(targetGoal)) {
+    console.log(`\n=== CANDIDATE RANKING FOR SUBMIT ACTION ("${targetGoal}") ===`);
+    for (const c of candidates) {
+      const n = c.node;
+      const isSubmit = isSubmitControl(n);
+      const isSpecialized = isSpecializedNonSubmitControl(n);
+      console.log(
+        `CANDIDATE elementId=${n.id} selector="${n.selector}" tag=${n.tag} role=${n.role ?? 'undefined'} type=${n.type ?? 'undefined'} name="${n.name ?? ''}" aria-label="${n.label ?? ''}" text="${n.text ?? ''}" value="${n.value ?? ''}" formId=${n.formId ?? 'undefined'} intent.click=${intent.click} intent.fill=${intent.fill} isSubmitControl=${isSubmit} isSpecializedNonSubmit=${isSpecialized} finalScore=${c.score}`,
+      );
+    }
+  }
 
   return {
     candidates,
@@ -306,6 +361,7 @@ export function rankCandidates(input: PlanInput): Ranking {
     mode,
     searchQuery,
     targetTokens,
+    explicitInput,
   };
 }
 
@@ -344,6 +400,23 @@ function containsVerb(text: string): boolean {
 const describe = (n: ScrubbedNode): string =>
   (n.label ?? n.text ?? n.placeholder ?? n.name ?? n.tag).slice(0, 40);
 
+function isSubmitControl(n: ScrubbedNode): boolean {
+  if (n.role === 'submit' || n.type === 'submit') return true;
+  if (n.tag === 'button' && (n.type === 'submit' || !n.type)) return true;
+  if (n.tag === 'input' && n.type === 'submit') return true;
+  return false;
+}
+
+const SPECIALIZED_NON_SUBMIT_RE =
+  /\b(?:voice|speech|mic|microphone|audio|listen|speak|camera|lens|photo|scan|upload|attachment|clear|reset|dismiss)\b/i;
+
+function isSpecializedNonSubmitControl(n: ScrubbedNode): boolean {
+  const hay = `${n.label ?? ''} ${n.text ?? ''} ${n.placeholder ?? ''} ${n.name ?? ''}`.toLowerCase();
+  if (SPECIALIZED_NON_SUBMIT_RE.test(hay)) return true;
+  if (n.type === 'button' && SPECIALIZED_NON_SUBMIT_RE.test(hay)) return true;
+  return false;
+}
+
 function scoreNode(
   n: ScrubbedNode,
   targetTokens: readonly string[],
@@ -352,6 +425,7 @@ function scoreNode(
   mode: RankingMode,
   searchQuery: string | undefined,
   targetGoal: string,
+  searchFormIds: Set<number> = new Set(),
 ): number {
   const hay = haystack(n);
   if (!hay) return 0;
@@ -518,18 +592,73 @@ function scoreNode(
     }
   }
 
-  if (keyword < 2) return 0;
-
-  let score = keyword;
-
   const isChanger = isStateChanger(n);
   const isNav = isNavigator(n);
+
+  const goalLower = targetGoal.toLowerCase();
+  const explicitInput = /\b(box|field|input|textbox|searchbox)\b/.test(goalLower);
+  const explicitButton = /\b(button|btn|submit)\b/.test(goalLower);
+  const explicitLink = /\b(link|url)\b/.test(goalLower);
+
+  let semanticScore = 0;
+
+  const goalHasSpecializedTerm =
+    /\b(voice|speech|mic|microphone|audio|listen|speak|camera|lens|photo|scan|upload|attachment|clear|reset|dismiss)\b/i.test(targetGoal);
+
+  const isSubmitIntent =
+    !goalHasSpecializedTerm &&
+    !explicitInput &&
+    (/\b(submit|send|go)\b/i.test(targetGoal) ||
+      (/\bsearch\b/i.test(targetGoal) && !intent.fill));
+
+  if (isSubmitIntent) {
+    if (isSubmitControl(n)) {
+      semanticScore += 30;
+    }
+
+    if (n.formId !== undefined && searchFormIds.has(n.formId)) {
+      if (isSubmitControl(n) || n.tag === 'button' || n.role === 'button') {
+        semanticScore += 25;
+      }
+    }
+
+    if (isSpecializedNonSubmitControl(n)) {
+      semanticScore -= 35;
+    }
+  }
+
+  // Semantic compatibility adjustments
+  if (intent.fill) {
+    if (kind === 'fill') semanticScore += 15;
+    else if (isChanger || kind === 'click') semanticScore -= 20;
+  }
+
+  if (explicitInput) {
+    if (kind === 'fill') semanticScore += 15;
+    else if (isChanger || kind === 'click') semanticScore -= 15;
+  }
+
+  if (explicitButton) {
+    if (isChanger) semanticScore += 15;
+    else if (kind === 'fill') {
+      // Allow search inputs as a fallback for "submit the search"
+      if (n.type === 'search' || n.role === 'searchbox') semanticScore += 5;
+      else semanticScore -= 15;
+    }
+  }
+
+  if (explicitLink) {
+    if (isNav) semanticScore += 15;
+    else if (kind === 'fill' || isChanger) semanticScore -= 15;
+  }
+
+  if (keyword < 2 && semanticScore <= 0) return 0;
+
+  let score = keyword + semanticScore;
+
   const hasVerb = containsVerb(hay);
 
-  if (intent.fill && kind === 'fill') score += 8;
-  if (intent.fill && kind === 'click') score -= 5;
-
-  if (intent.click) {
+  if (intent.click && !explicitInput) {
     if (isChanger) {
       score += 8;
     } else if (isNav) {
@@ -542,6 +671,7 @@ function scoreNode(
     if (isNav) score += 6;
     else if (isChanger) score -= 3;
   }
+
 
   if (kind === 'other') score -= 8;
 
@@ -570,8 +700,20 @@ function toAction(
   node: ScrubbedNode,
   goal: string,
   ranking: Ranking,
+  originalGoal: string = goal,
 ): AgentAction {
   const kind = kindOf(node);
+
+  if (kind === 'fill') {
+    // STRICT SEPARATION: If intent is purely to target/focus the control, do NOT invent a value.
+    if (!ranking.intent.fill && ranking.explicitInput) {
+      return {
+        action: 'click',
+        selector: node.selector,
+        reason: `focus explicit input target "${describe(node)}"`,
+      };
+    }
+  }
 
   /*
    * Universal search behavior:
@@ -606,13 +748,31 @@ function toAction(
   }
 
   if (kind === 'fill') {
+
     const valueType = inferValueType(node);
+
+    // EXPLICIT SUBMIT ON INPUT (when no dedicated button was found)
+    if (/\b(submit|search|go|send)\b/i.test(goal) && !ranking.intent.fill) {
+      return {
+        action: 'fill',
+        selector: node.selector,
+        valueType: 'LITERAL',
+        value: node.value || '', // Keep existing value to simulate pure Enter
+        submit: true,
+        reason: 'explicit submit requested on input control',
+      };
+    }
+
+    const isSearchTask = /\b(?:search|find|query|lookup)\b(?!\s+(?:box|bar|field|input|button|icon|result))/i.test(originalGoal);
+    const isSearchControl = node.type === 'search' || node.role === 'searchbox' || /\b(search|query)\b/i.test(node.name || String(node.id) || '');
+    const shouldSubmit = /\b(search|find|submit|send|go|query)\b/i.test(goal) || (isSearchTask && isSearchControl);
 
     if (valueType !== 'LITERAL') {
       return {
         action: 'fill',
         selector: node.selector,
         valueType,
+        submit: shouldSubmit,
         reason: `keyword match on "${describe(node)}"`,
       };
     }
@@ -630,10 +790,10 @@ function toAction(
     return {
       action: 'fill',
       selector: node.selector,
-      valueType,
+      valueType: 'LITERAL',
       value: literal,
-      submit: /\b(search|find|submit|send|go|query)\b/i.test(goal),
-      reason: `keyword match on "${describe(node)}"`,
+      submit: shouldSubmit,
+      reason: `fill intent with literal "${literal}"`,
     };
   }
 
@@ -673,6 +833,7 @@ export function literalFor(goal: string): string | undefined {
 
   if (after?.[1]) {
     return after[1]
+      .replace(/\s+(?:in|into|on|at|inside)\s+(?:the\s+)?(?:search\s+)?(?:box|bar|field|input|button|textbox).*$/i, '')
       .replace(/\s+(?:and|then)\s+(?:add|buy|purchase|open|select|choose|click|submit)\b.*$/i, '')
       .replace(/^["'“](.+)["'”]$/, '$1')
       .trim();
@@ -734,6 +895,18 @@ function extractSearchQuery(goal: string): string | undefined {
   if (!match?.[1]) return undefined;
 
   let query = match[1].trim();
+
+  /*
+   * Strip trailing locators.
+   *
+   * "sih26171 in the search box"
+   * →
+   * "sih26171"
+   */
+  query = query.replace(
+    /\s+(?:in|into|on|at|inside)\s+(?:the\s+)?(?:search\s+)?(?:box|bar|field|input|button|textbox).*$/i,
+    '',
+  );
 
   /*
    * Stop before a later task instruction.
