@@ -1,5 +1,16 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ChevronDown, Cpu, ListChecks, Play, Server, Settings2, ShieldCheck, Square, Terminal } from 'lucide-react';
+import {
+  ChevronDown,
+  Cpu,
+  ListChecks,
+  Play,
+  Server,
+  Settings2,
+  ShieldCheck,
+  Square,
+  Terminal,
+  Trash2
+} from 'lucide-react';
 import type { AgentLogEntry, AgentStatus } from '@shared/types';
 import { loadSettings, saveSettings, type Settings } from '~/lib/settings';
 
@@ -8,6 +19,71 @@ interface StatusReply {
   status?: AgentStatus;
   logs?: AgentLogEntry[];
   error?: string;
+}
+
+interface PromptHistoryItem {
+  id: string;
+  prompt: string;
+  createdAt: number;
+}
+
+const PROMPT_HISTORY_KEY = 'pva.promptHistory';
+const MAX_PROMPT_HISTORY = 50;
+
+async function loadPromptHistory(): Promise<PromptHistoryItem[]> {
+  const raw = await chrome.storage.local.get(PROMPT_HISTORY_KEY);
+  const value = raw[PROMPT_HISTORY_KEY];
+
+  if (!Array.isArray(value)) return [];
+
+  return value
+    .filter(
+      (item): item is PromptHistoryItem =>
+        typeof item?.id === 'string' &&
+        typeof item?.prompt === 'string' &&
+        typeof item?.createdAt === 'number'
+    )
+    .sort((a, b) => b.createdAt - a.createdAt);
+}
+
+async function savePromptToHistory(prompt: string): Promise<PromptHistoryItem[]> {
+  const trimmed = prompt.trim();
+  if (!trimmed) return loadPromptHistory();
+
+  const history = await loadPromptHistory();
+
+  // Avoid storing the same prompt twice in a row.
+  const withoutDuplicate = history.filter((item) => item.prompt !== trimmed);
+
+  const next: PromptHistoryItem[] = [
+    {
+      id: crypto.randomUUID(),
+      prompt: trimmed,
+      createdAt: Date.now(),
+    },
+    ...withoutDuplicate,
+  ].slice(0, MAX_PROMPT_HISTORY);
+
+  await chrome.storage.local.set({
+    [PROMPT_HISTORY_KEY]: next,
+  });
+
+  return next;
+}
+
+async function deletePromptFromHistory(id: string): Promise<PromptHistoryItem[]> {
+  const history = await loadPromptHistory();
+  const next = history.filter((item) => item.id !== id);
+
+  await chrome.storage.local.set({
+    [PROMPT_HISTORY_KEY]: next,
+  });
+
+  return next;
+}
+
+async function clearPromptHistory(): Promise<void> {
+  await chrome.storage.local.remove(PROMPT_HISTORY_KEY);
 }
 
 const send = <T,>(msg: Record<string, unknown>) => chrome.runtime.sendMessage(msg) as Promise<T>;
@@ -20,6 +96,7 @@ const detail = (d: unknown): string => {
 
 export default function App() {
   const [goal, setGoal] = useState('');
+  const [promptHistory, setPromptHistory] = useState<PromptHistoryItem[]>([]);
   const [status, setStatus] = useState<AgentStatus | null>(null);
   const [logs, setLogs] = useState<AgentLogEntry[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -35,12 +112,23 @@ export default function App() {
 
   useEffect(() => {
     void loadSettings().then(setSettings);
+    void loadPromptHistory().then(setPromptHistory);
     void refresh();
+
     const t = setInterval(refresh, 1000);
     return () => clearInterval(t);
   }, [refresh]);
 
   const patch = async (p: Partial<Settings>) => setSettings(await saveSettings(p));
+
+  const removePrompt = async (id: string) => {
+    setPromptHistory(await deletePromptFromHistory(id));
+  };
+
+  const clearHistory = async () => {
+    await clearPromptHistory();
+    setPromptHistory([]);
+  };
 
   const running = status?.running ?? false;
 
@@ -50,12 +138,14 @@ export default function App() {
       setErrorMsg('Type what the agent should do on this tab.');
       return;
     }
+    const prompt = goal.trim();
+    setPromptHistory(await savePromptToHistory(prompt));
     setBusy(true);
     try {
       const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
       const res = await send<{ ok: boolean; error?: string }>({
         kind: 'AGENT_START',
-        goal: goal.trim(),
+        goal: prompt,
         tabId: activeTab?.id,
       });
       if (!res?.ok && res?.error) setErrorMsg(res.error);
@@ -130,6 +220,45 @@ export default function App() {
           {running ? `Stop · ${status?.step ?? 0}/${status?.maxSteps ?? '?'}` : 'Run'}
         </button>
       </div>
+
+      {promptHistory.length > 0 && (
+        <div className="prompt-history">
+          <div className="prompt-history-header">
+            <span className="prompt-history-title">Prompt history</span>
+
+            <button
+              className="prompt-history-clear"
+              onClick={() => void clearHistory()}
+              title="Delete all saved prompts"
+            >
+              Clear all
+            </button>
+          </div>
+
+          <div className="prompt-history-list">
+            {promptHistory.map((item) => (
+              <div className="prompt-history-item" key={item.id}>
+                <button
+                  className="prompt-history-load"
+                  title={item.prompt}
+                  onClick={() => setGoal(item.prompt)}
+                >
+                  {item.prompt}
+                </button>
+
+                <button
+                  className="prompt-history-delete"
+                  title="Delete prompt"
+                  aria-label={`Delete prompt: ${item.prompt}`}
+                  onClick={() => void removePrompt(item.id)}
+                >
+                  <Trash2 size={12} />
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="engine" data-tone={engine.tone}>
         <Cpu size={12} />
