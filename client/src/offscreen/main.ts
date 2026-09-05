@@ -13,6 +13,7 @@
  * because the API is not exposed to web workers either.
  */
 import type { WorkerRequest, WorkerResponse } from '~/ai/vlm-worker';
+import type { SttWorkerRequest, SttWorkerResponse } from '~/ai/stt-worker';
 import { dataUrlToBitmap } from '~/privacy/canvas-redactor';
 import { newId, type AgentAction, type AgentDecision, type ScrubbedDom } from '@shared/types';
 import type { NanoMessageKind } from '~/ai/nano-bridge';
@@ -28,9 +29,13 @@ import {
 import { probeNano } from '~/ai/nano-session';
 
 const worker = new Worker(new URL('../ai/vlm-worker.ts', import.meta.url), { type: 'module' });
+const sttWorker = new Worker(new URL('../ai/stt-worker.ts', import.meta.url), { type: 'module' });
 
 type Waiter = { resolve: (r: WorkerResponse) => void; reject: (e: Error) => void; want: WorkerResponse['type'] };
 const waiters = new Map<string, Waiter>();
+
+type SttWaiter = { resolve: (r: SttWorkerResponse) => void; reject: (e: Error) => void; want: SttWorkerResponse['type'] };
+const sttWaiters = new Map<string, SttWaiter>();
 
 /**
  * Per-file download progress, aggregated.
@@ -96,6 +101,28 @@ worker.addEventListener('message', (ev: MessageEvent<WorkerResponse>) => {
   }
 });
 
+sttWorker.addEventListener('message', (ev: MessageEvent<SttWorkerResponse>) => {
+  const msg = ev.data;
+  if (msg.type === 'STT_PROGRESS') {
+    const percent = typeof msg.progress === 'number' ? Math.round(msg.progress) : undefined;
+    void chrome.runtime
+      .sendMessage({ target: 'background', kind: 'STT_PROGRESS', status: msg.status, progress: percent })
+      .catch(() => {});
+    return;
+  }
+  const w = sttWaiters.get(msg.id);
+  if (!w) return;
+  if (msg.type === 'ERROR') {
+    sttWaiters.delete(msg.id);
+    w.reject(new Error(msg.message));
+    return;
+  }
+  if (msg.type === w.want) {
+    sttWaiters.delete(msg.id);
+    w.resolve(msg);
+  }
+});
+
 function ask<T extends WorkerResponse['type']>(
   req: WorkerRequest,
   want: T,
@@ -118,9 +145,31 @@ function ask<T extends WorkerResponse['type']>(
   });
 }
 
+function askStt<T extends SttWorkerResponse['type']>(
+  req: SttWorkerRequest,
+  want: T,
+  transfer: Transferable[] = [],
+  timeoutMs = 60_000,
+): Promise<Extract<SttWorkerResponse, { type: T }>> {
+  return new Promise((resolve, reject) => {
+    sttWaiters.set(req.id, { resolve: resolve as (r: SttWorkerResponse) => void, reject, want });
+    const timer = setTimeout(() => {
+      sttWaiters.delete(req.id);
+      reject(new Error(`stt-worker ${req.type} timed out`));
+    }, timeoutMs);
+    const settle = <R>(fn: (v: R) => void) => (v: R) => {
+      clearTimeout(timer);
+      fn(v);
+    };
+    const w = sttWaiters.get(req.id)!;
+    sttWaiters.set(req.id, { ...w, resolve: settle(w.resolve), reject: settle(w.reject) });
+    sttWorker.postMessage(req, transfer);
+  });
+}
+
 export interface OffscreenInferRequest {
   target: 'offscreen';
-  kind: 'PROBE' | 'INIT' | 'INFER' | NanoMessageKind;
+  kind: 'PROBE' | 'INIT' | 'INFER' | NanoMessageKind | 'STT_INIT' | 'STT_TRANSCRIBE';
   modelKey?: string;
   goal?: string;
   dom?: ScrubbedDom;
@@ -132,6 +181,9 @@ export interface OffscreenInferRequest {
   input?: ReplanInput | VerifyInput;
   /** NANO_PROBE only: create a session, downloading weights if Chrome needs to. */
   allowDownload?: boolean;
+  /** STT_TRANSCRIBE: base64-encoded Float32Array of 16 kHz mono audio. */
+  audioBase64?: string;
+  sampleRate?: number;
 }
 
 chrome.runtime.onMessage.addListener((message: OffscreenInferRequest, _sender, sendResponse) => {
@@ -200,6 +252,26 @@ chrome.runtime.onMessage.addListener((message: OffscreenInferRequest, _sender, s
             90_000,
           );
           sendResponse({ ok: true, decision: r.decision satisfies AgentDecision, raw: r.raw });
+          return;
+        }
+        case 'STT_INIT': {
+          await askStt({ type: 'STT_INIT', id: newId() }, 'STT_READY', [], 300_000);
+          sendResponse({ ok: true });
+          return;
+        }
+        case 'STT_TRANSCRIBE': {
+          if (!message.audioBase64) throw new Error('STT_TRANSCRIBE missing audioBase64');
+          const binary = atob(message.audioBase64);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+          const audio = new Float32Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 4));
+          const r = await askStt(
+            { type: 'STT_TRANSCRIBE', id: newId(), audio, sampleRate: message.sampleRate ?? 16_000 },
+            'STT_RESULT',
+            [audio.buffer],
+            60_000,
+          );
+          sendResponse({ ok: true, transcript: r.transcript });
           return;
         }
       }

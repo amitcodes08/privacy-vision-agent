@@ -30,6 +30,7 @@ export default defineConfig({
       input: {
         popup: resolve(__dirname, 'src/popup/index.html'),
         offscreen: resolve(__dirname, 'src/offscreen/index.html'),
+        permission: resolve(__dirname, 'src/permission/index.html'),
       },
     },
   },

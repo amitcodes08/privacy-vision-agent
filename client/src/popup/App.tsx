@@ -1,15 +1,17 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ChevronDown,
   Cpu,
   ListChecks,
+  Mic,
+  MicOff,
   Play,
   Server,
   Settings2,
   ShieldCheck,
   Square,
   Terminal,
-  Trash2
+  Trash2,
 } from 'lucide-react';
 import type { AgentLogEntry, AgentStatus } from '@shared/types';
 import { loadSettings, saveSettings, type Settings } from '~/lib/settings';
@@ -86,7 +88,144 @@ async function clearPromptHistory(): Promise<void> {
   await chrome.storage.local.remove(PROMPT_HISTORY_KEY);
 }
 
+type MicState = 'idle' | 'loading' | 'recording' | 'transcribing' | 'error';
+
 const send = <T,>(msg: Record<string, unknown>) => chrome.runtime.sendMessage(msg) as Promise<T>;
+
+function useStt(onTranscript: (t: string) => void) {
+  const [micState, setMicState] = useState<MicState>('idle');
+  const [micError, setMicError] = useState<string | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+
+  useEffect(() => {
+    const cleanup = () => {
+      recorderRef.current?.stop();
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+    };
+    window.addEventListener('unload', cleanup);
+    return () => window.removeEventListener('unload', cleanup);
+  }, []);
+
+  useEffect(() => {
+    const handleFocus = () => {
+      if (navigator.permissions?.query) {
+        navigator.permissions
+          .query({ name: 'microphone' as PermissionName })
+          .then((res) => {
+            if (res.state === 'granted') {
+              setMicError(null);
+            }
+          })
+          .catch(() => null);
+      }
+    };
+    window.addEventListener('focus', handleFocus);
+    return () => window.removeEventListener('focus', handleFocus);
+  }, []);
+
+  const stopRecording = useCallback(() => {
+    const recorder = recorderRef.current;
+    if (!recorder || recorder.state === 'inactive') return;
+    recorder.stop();
+  }, []);
+
+  const startRecording = useCallback(async (sttReady: boolean) => {
+    setMicError(null);
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+      if (err instanceof Error && err.name === 'NotAllowedError') {
+        try {
+          await chrome.tabs.create({ url: chrome.runtime.getURL('src/permission/index.html') });
+          setMicError('Opening permission tab… Please allow microphone access, then click the mic again.');
+        } catch {
+          setMicError('Microphone permission required');
+        }
+      } else {
+        setMicError('Microphone unavailable or blocked by system');
+      }
+      setMicState('idle');
+      return;
+    }
+
+    if (!sttReady) {
+      setMicState('loading');
+      await send<{ ok: boolean }>({ kind: 'STT_WARM_UP' }).catch(() => null);
+    }
+
+    streamRef.current = stream;
+    chunksRef.current = [];
+    const mimeType =
+      typeof MediaRecorder.isTypeSupported === 'function' && MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : typeof MediaRecorder.isTypeSupported === 'function' && MediaRecorder.isTypeSupported('audio/webm')
+        ? 'audio/webm'
+        : '';
+    const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+    recorderRef.current = recorder;
+    recorder.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
+    recorder.onstop = async () => {
+      stream.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+      setMicState('transcribing');
+      try {
+        const blob = new Blob(chunksRef.current, { type: recorder.mimeType });
+        const arrayBuffer = await blob.arrayBuffer();
+        const audioCtx = new AudioContext();
+        if (audioCtx.state === 'suspended') {
+          await audioCtx.resume();
+        }
+        const decoded = await audioCtx.decodeAudioData(arrayBuffer);
+        await audioCtx.close();
+
+        const TARGET_SR = 16_000;
+        const offlineCtx = new OfflineAudioContext(1, Math.ceil(decoded.duration * TARGET_SR), TARGET_SR);
+        const src = offlineCtx.createBufferSource();
+        src.buffer = decoded;
+        src.connect(offlineCtx.destination);
+        src.start(0);
+        const resampled = await offlineCtx.startRendering();
+        const pcm = resampled.getChannelData(0);
+
+        let maxAmp = 0;
+        for (let i = 0; i < pcm.length; i++) {
+          const abs = Math.abs(pcm[i]!);
+          if (abs > maxAmp) maxAmp = abs;
+        }
+        if (maxAmp > 0 && maxAmp < 0.8) {
+          const scale = 0.8 / maxAmp;
+          for (let i = 0; i < pcm.length; i++) {
+            pcm[i] = (pcm[i] ?? 0) * scale;
+          }
+        }
+
+        const bytes = new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+        let binary = '';
+        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!);
+        const audioBase64 = btoa(binary);
+
+        const r = await send<{ ok: boolean; transcript?: string; error?: string }>({
+          kind: 'STT_TRANSCRIBE',
+          audioBase64,
+          sampleRate: TARGET_SR,
+        });
+        if (r.ok && r.transcript) onTranscript(r.transcript);
+        else if (!r.ok) setMicError(r.error ?? 'Transcription failed');
+      } catch (err) {
+        setMicError(err instanceof Error ? err.message : 'Transcription failed');
+      } finally {
+        setMicState('idle');
+      }
+    };
+    recorder.start();
+    setMicState('recording');
+  }, [onTranscript]);
+
+  return { micState, micError, startRecording, stopRecording };
+}
 
 /** One short line for a log entry's `data`, whatever shape it arrived in. */
 const detail = (d: unknown): string => {
@@ -103,6 +242,8 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [openPanel, setOpenPanel] = useState<'none' | 'settings' | 'activity'>('none');
+
+  const { micState, micError, startRecording, stopRecording } = useStt((t) => setGoal(t));
 
   const refresh = useCallback(async () => {
     const reply = await send<StatusReply>({ kind: 'AGENT_STATUS_REQUEST' }).catch(() => null);
@@ -188,7 +329,7 @@ export default function App() {
 
   const plan = status?.plan;
 
-  const problem = errorMsg ?? status?.lastError ?? status?.modelError;
+  const problem = micError ?? errorMsg ?? status?.lastError ?? status?.modelError;
   const acted = (status?.localDecisions ?? 0) + (status?.heuristicDecisions ?? 0);
   const escalated = status?.escalations ?? 0;
   const hasRun = acted + escalated > 0;
@@ -211,6 +352,25 @@ export default function App() {
             if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) void start();
           }}
         />
+        <button
+          id="mic-btn"
+          className="mic ghost"
+          data-state={micState}
+          disabled={micState === 'transcribing' || micState === 'loading'}
+          title={
+            micError ? micError :
+            micState === 'loading' ? 'Loading STT model…' :
+            micState === 'recording' ? 'Click to stop recording' :
+            micState === 'transcribing' ? 'Transcribing…' :
+            'Dictate your goal'
+          }
+          onClick={() => {
+            if (micState === 'recording') stopRecording();
+            else if (micState === 'idle' || micState === 'error') void startRecording(status?.sttReady ?? false);
+          }}
+        >
+          {micState === 'recording' ? <MicOff size={14} /> : <Mic size={14} />}
+        </button>
         <button
           className="primary"
           onClick={running ? () => void send({ kind: 'AGENT_STOP' }) : start}
@@ -280,6 +440,18 @@ export default function App() {
           </span>
         )}
       </div>
+
+      {(status?.sttLoading || micState === 'loading' || micState === 'transcribing') && (
+        <div className="engine" data-tone="busy">
+          <Mic size={12} />
+          <span>
+            {micState === 'transcribing' ? 'transcribing…' : (status?.sttStage ?? 'loading Whisper tiny')}
+          </span>
+          {status?.sttLoading && status.sttProgress !== undefined && (
+            <i className="bar" style={{ ['--p' as string]: `${status.sttProgress}%` }} />
+          )}
+        </div>
+      )}
 
       <div className="engine" data-tone={planner.tone} title={planner.title}>
         <ListChecks size={12} />

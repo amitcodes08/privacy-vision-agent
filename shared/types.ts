@@ -516,7 +516,12 @@ export type RuntimeMessage =
   | { kind: 'CAPTURE_FRAME_RESULT'; dataUrl: string }
   | { kind: 'ESCALATE'; request: InferenceRequestPayload }
   | { kind: 'ESCALATE_RESULT'; decision: AgentDecision | null; error?: string }
-  | { kind: 'LOG'; entry: AgentLogEntry };
+  | { kind: 'LOG'; entry: AgentLogEntry }
+  | { kind: 'STT_WARM_UP' }
+  | { kind: 'STT_TRANSCRIBE'; audioBase64: string; sampleRate: number }
+  | { kind: 'STT_RESULT'; transcript: string }
+  | { kind: 'STT_ERROR'; error: string }
+  | { kind: 'STT_PROGRESS'; status: string; progress?: number };
 
 export interface AgentStatus {
   running: boolean;
@@ -560,6 +565,11 @@ export interface AgentStatus {
   cacheHits?: number;
   macroBatchesExecuted?: number;
   redactions: number;
+  sttLoading?: boolean;
+  sttReady?: boolean;
+  sttStage?: string;
+  sttProgress?: number;
+  sttError?: string;
 }
 
 export interface AgentLogEntry {

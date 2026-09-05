@@ -64,6 +64,19 @@ button.ghost {
 button.ghost:hover { background: var(--sunken); }
 button.wide { width: 100%; }
 
+button.mic { flex: none; padding: 0 10px; align-self: stretch; }
+button.mic[data-state='recording'] {
+  color: var(--err);
+  border-color: var(--err);
+  animation: mic-pulse 1.2s ease-in-out infinite;
+}
+button.mic[data-state='transcribing'] { color: var(--accent); border-color: var(--accent); }
+button.mic[data-state='error'] { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--line)); }
+@keyframes mic-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--err) 40%, transparent); }
+  50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--err) 0%, transparent); }
+}
+
 /* ---- engine status strip ---- */
 .engine {
   position: relative; overflow: hidden;

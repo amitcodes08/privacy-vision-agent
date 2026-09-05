@@ -76,6 +76,8 @@ const status: AgentStatus = {
   cacheHits: 0,
   macroBatchesExecuted: 0,
   redactions: 0,
+  sttLoading: false,
+  sttReady: false,
 };
 
 /* ---------------------------------------------------------------- *
@@ -1429,6 +1431,43 @@ chrome.runtime.onMessage.addListener((msg: Record<string, unknown>, _sender, sen
           if (pct !== undefined) status.modelProgress = pct;
           if (typeof msg.status === 'string') status.modelStage = msg.status;
           sendResponse({ ok: true });
+          return;
+        }
+        case 'STT_PROGRESS': {
+          const pct = typeof msg.progress === 'number' ? Math.round(msg.progress) : undefined;
+          if (pct !== undefined) status.sttProgress = pct;
+          if (typeof msg.status === 'string') status.sttStage = msg.status as string;
+          sendResponse({ ok: true });
+          return;
+        }
+        case 'STT_WARM_UP': {
+          sendResponse({ ok: true, status });
+          status.sttLoading = true;
+          status.sttError = undefined;
+          void askOffscreen({ kind: 'STT_INIT' }).then((r) => {
+            status.sttLoading = false;
+            if (r.ok) {
+              status.sttReady = true;
+              status.sttStage = 'ready';
+            } else {
+              status.sttReady = false;
+              status.sttError = (r as { ok: false; error: string }).error;
+              logger.warn('stt', `model init failed: ${status.sttError}`);
+            }
+          });
+          return;
+        }
+        case 'STT_TRANSCRIBE': {
+          const r = await askOffscreen<{ transcript: string }>({
+            kind: 'STT_TRANSCRIBE',
+            audioBase64: msg.audioBase64 as string,
+            sampleRate: msg.sampleRate as number,
+          });
+          if (r.ok) {
+            sendResponse({ ok: true, transcript: r.transcript });
+          } else {
+            sendResponse({ ok: false, error: (r as { ok: false; error: string }).error });
+          }
           return;
         }
         case 'WARM_UP': {
